@@ -5,23 +5,36 @@ import math
 import winsound
 import os
 import pygame
+import socket
+import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 BOARD_W = 32
 BOARD_H = 16
-CELL    = 24
+CELL = 24
 
 SEP_COL = 15
 
 P1_COLOR = (180, 0, 255)
 P2_COLOR = (0, 120, 255)
-TRAP     = (255, 0, 0)
-BONUS    = (0, 255, 0)
+TRAP = (255, 0, 0)
+BONUS = (0, 255, 0)
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+
+UDP_TARGET_IP = "255.255.255.255"
+UDP_SEND_PORT = 4626
+UDP_RECV_PORT = 7800
+
+BOARD_WIDTH = 16
+BOARD_LENGTH = 32
+NUM_CHANNELS = 8
+LEDS_PER_CHANNEL = 64
+FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
 
 def hex3(c):
     return '#%02x%02x%02x' % c
-
 
 DIGITS = {
     "0": ["111","101","101","101","111"],
@@ -46,7 +59,6 @@ DIGITS = {
     "!": ["010","010","010","000","010"],
     " ": ["000","000","000","000","000"],
 }
-
 
 FONT_3x5 = {
     ' ': [0,0,0], '!': [0,23,0], '"': [3,0,3], '#': [31,10,31],
@@ -75,6 +87,125 @@ FONT_3x5 = {
     '|': [0,31,0], '}': [17,27,4], '~': [2,1,2],
 }
 
+class Network:
+    def __init__(self, target_ip=UDP_TARGET_IP, send_port=UDP_SEND_PORT, recv_port=UDP_RECV_PORT):
+        self.target_ip = target_ip
+        self.send_port = send_port
+        self.recv_port = recv_port
+        self.seq = 0
+        self._lock = threading.Lock()
+        self.triggers = {}
+
+        self.sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock_recv.settimeout(0.3)
+        self.sock_recv.bind(("0.0.0.0", self.recv_port))
+
+        self._running = True
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+
+    def _recv_loop(self):
+        while self._running:
+            try:
+                data, _ = self.sock_recv.recvfrom(2048)
+                if len(data) >= 1373 and data[0] == 0x88:
+                    with self._lock:
+                        for ch in range(8):
+                            base = 2 + ch * 171
+                            for led in range(64):
+                                self.triggers[(ch, led)] = (data[base + 1 + led] == 0xCC)
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    def is_pressed(self, x, y):
+        if not (0 <= x < BOARD_WIDTH and 0 <= y < BOARD_LENGTH):
+            return False
+
+        ch = min(y // 4, NUM_CHANNELS - 1)
+        row = y % 4
+        led = row * 16 + x if row % 2 == 0 else row * 16 + (15 - x)
+
+        with self._lock:
+            return self.triggers.get((ch, led), False)
+
+    def send_frame(self, grid):
+        buf = bytearray(FRAME_DATA_LENGTH)
+
+        for (x, y), color in grid.items():
+            if not (0 <= x < BOARD_WIDTH and 0 <= y < BOARD_LENGTH):
+                continue
+
+            ch = min(y // 4, NUM_CHANNELS - 1)
+            row = y % 4
+            led = row * 16 + x if row % 2 == 0 else row * 16 + (15 - x)
+
+            block = NUM_CHANNELS * 3
+            offset = led * block + ch
+
+            if offset + NUM_CHANNELS * 2 < len(buf):
+                buf[offset] = color[1]
+                buf[offset + NUM_CHANNELS] = color[0]
+                buf[offset + NUM_CHANNELS * 2] = color[2]
+
+        self._send_packet(buf)
+
+    def _send_packet(self, frame_data):
+        self.seq = (self.seq % 0xFFFF) + 1
+        ip, port = self.target_ip, self.send_port
+
+        def tx(pkt):
+            try:
+                self.sock_send.sendto(pkt, (ip, port))
+            except Exception:
+                pass
+
+        def make(inner, cs=0x1E):
+            r1, r2 = random.randint(0, 127), random.randint(0, 127)
+            ln = len(inner) - 1
+            p = bytearray([0x75, r1, r2, (ln >> 8) & 0xFF, ln & 0xFF]) + bytearray(inner)
+            p += bytearray([cs, 0x00])
+            return p
+
+        tx(bytearray([
+            0x75, 0, 0, 0, 8, 2, 0, 0, 0x33, 0x44,
+            (self.seq >> 8) & 0xFF, self.seq & 0xFF, 0, 0, 0, 0x0E, 0
+        ]))
+
+        pay = bytearray()
+        for _ in range(NUM_CHANNELS):
+            pay += bytes([(LEDS_PER_CHANNEL >> 8) & 0xFF, LEDS_PER_CHANNEL & 0xFF])
+
+        tx(make(bytearray([
+            2, 0, 0, 0x88, 0x77, 0xFF, 0xF0,
+            (len(pay) >> 8) & 0xFF, len(pay) & 0xFF
+        ]) + pay))
+
+        for i, idx in enumerate(range(0, len(frame_data), 984), 1):
+            chunk = frame_data[idx:idx + 984]
+            inner = bytearray([
+                2, 0, 0, 0x88, 0x77,
+                (i >> 8) & 0xFF, i & 0xFF,
+                (len(chunk) >> 8) & 0xFF, len(chunk) & 0xFF
+            ]) + bytearray(chunk)
+            tx(make(inner, 0x1E if len(chunk) == 984 else 0x36))
+            time.sleep(0.001)
+
+        tx(bytearray([
+            0x75, 0, 0, 0, 8, 2, 0, 0, 0x55, 0x66,
+            (self.seq >> 8) & 0xFF, self.seq & 0xFF, 0, 0, 0, 0x0E, 0
+        ]))
+
+    def stop(self):
+        self._running = False
+        try:
+            self.sock_recv.close()
+        except Exception:
+            pass
 
 class Game:
     def __init__(self):
@@ -89,37 +220,41 @@ class Game:
         )
         self.canvas.pack()
 
-        self.tiles  = {}
+        self.net = Network()
+        self.grid = {}
+
+        self.tiles = {}
         self.scores = [0, 0]
 
         self.bonus_active = [False, False]
-        self.bonus_time   = [0, 0]
+        self.bonus_time = [0, 0]
 
-        self.round       = 1
-        self.max_rounds  = 3
-        self.round_time  = 20
+        self.round = 1
+        self.max_rounds = 3
+        self.round_time = 20
         self.round_start = time.time()
 
-        self.start_anim  = True
-        self.start_time  = time.time()
+        self.start_anim = True
+        self.start_time = time.time()
 
-        self.wipe   = False
+        self.wipe = False
         self.wipe_x = 0
 
-        self.countdown         = False
-        self.countdown_val     = 3
-        self.countdown_time    = time.time()
+        self.countdown = False
+        self.countdown_val = 3
+        self.countdown_time = time.time()
         self.countdown_started = False
 
-        self.round_anim  = False
+        self.round_anim = False
         self.wave_radius = 0
 
         self.game_over_flag = False
-        self.winner_line1   = ""
-        self.winner_line2   = ""
-        self.winner_col     = (255, 255, 255)
+        self.winner_line1 = ""
+        self.winner_line2 = ""
+        self.winner_col = (255, 255, 255)
 
         self.root.bind("<Button-1>", self.click)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         try:
             pygame.mixer.init()
@@ -131,6 +266,13 @@ class Game:
 
         self.loop()
         self.root.mainloop()
+
+    def on_close(self):
+        try:
+            self.net.stop()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def sound_trap(self):
         winsound.PlaySound(
@@ -152,11 +294,17 @@ class Game:
         y1 = y * CELL
         x2 = x1 + CELL * scale
         y2 = y1 + CELL * scale
-        self.canvas.create_rectangle(x1, y1, x2, y2,
-                                     fill=hex3(color), outline="")
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=hex3(color), outline="")
+
+        for dx in range(scale):
+            for dy in range(scale):
+                px = x + dx
+                py = y + dy
+                if 0 <= px < BOARD_WIDTH and 0 <= py < BOARD_LENGTH:
+                    self.grid[(px, py)] = color
 
     def draw_led_text_centered(self, key):
-        scale   = 2
+        scale = 2
         pattern = DIGITS[key]
 
         char_w_cells = len(pattern[0]) * scale
@@ -172,22 +320,19 @@ class Game:
                     ly = start_y + ri * scale
                     for dx in range(scale):
                         for dy in range(scale):
-                            if 0 <= lx+dx < BOARD_W and 0 <= ly+dy < BOARD_H:
-                                self.led(lx + dx, ly + dy, (255, 255, 255))
+                            if 0 <= lx + dx < BOARD_W and 0 <= ly + dy < BOARD_H:
+                                self.led(lx + dx, ly + dy, WHITE)
 
     def draw_round_text(self):
-        scale   = 2
-        text    = f"R{self.round}"
-        char_w  = 3 * scale + scale
+        scale = 2
+        text = f"R{self.round}"
+        char_w = 3 * scale + scale
         total_w = len(text) * char_w - scale
         start_x = (BOARD_W - total_w) // 2
         start_y = (BOARD_H - 5 * scale) // 2
 
         for i, ch in enumerate(text):
-            if ch == "R":
-                pattern = ["110","101","110","101","101"]
-            else:
-                pattern = DIGITS.get(ch, [])
+            pattern = ["110","101","110","101","101"] if ch == "R" else DIGITS.get(ch, [])
             for ri, row in enumerate(pattern):
                 for ci, px in enumerate(row):
                     if px == "1":
@@ -195,27 +340,27 @@ class Game:
                         ly = start_y + ri * scale
                         for dx in range(scale):
                             for dy in range(scale):
-                                if 0 <= lx+dx < BOARD_W and 0 <= ly+dy < BOARD_H:
+                                if 0 <= lx + dx < BOARD_W and 0 <= ly + dy < BOARD_H:
                                     self.led(lx + dx, ly + dy, (220, 0, 0))
 
     def draw_pixel_text(self, line1, line2, color):
-        scale   = 1
-        char_w  = 3
-        char_h  = 5
+        scale = 1
+        char_w = 3
+        char_h = 5
         spacing = 1
 
-        step_x  = (char_w + spacing) * scale
-        step_y  = char_h * scale
-        gap     = 2
+        step_x = (char_w + spacing) * scale
+        step_y = char_h * scale
+        gap = 2
 
         total_h = step_y + (step_y + gap if line2 else 0)
-        base_y  = (BOARD_H - total_h) // 2
+        base_y = (BOARD_H - total_h) // 2
 
         def draw_line(text, start_y):
             total_w = len(text) * step_x - spacing * scale
             start_x = max(0, (BOARD_W - total_w) // 2)
             for i, ch in enumerate(text):
-                cols = FONT_3x5.get(ch, FONT_3x5.get(' ', [0,0,0]))
+                cols = FONT_3x5.get(ch, FONT_3x5.get(' ', [0, 0, 0]))
                 for ci, col_bits in enumerate(cols):
                     for ri in range(char_h):
                         if (col_bits >> ri) & 1:
@@ -231,14 +376,7 @@ class Game:
         if line2:
             draw_line(line2, base_y + step_y + gap)
 
-    def click(self, e):
-        if (self.start_anim or self.wipe or self.countdown
-                or self.round_anim or self.game_over_flag):
-            return
-
-        x = e.x // CELL
-        y = e.y // CELL
-
+    def handle_press(self, x, y):
         if (x, y) not in self.tiles:
             return
 
@@ -265,14 +403,21 @@ class Game:
                 self.sound_trap()
             elif kind == "bonus":
                 self.bonus_active[p] = True
-                self.bonus_time[p]   = time.time() + 15
+                self.bonus_time[p] = time.time() + 15
                 self.sound_bonus()
 
         del self.tiles[(x, y)]
 
+    def click(self, e):
+        if self.start_anim or self.wipe or self.countdown or self.round_anim or self.game_over_flag:
+            return
+
+        x = e.x // CELL
+        y = e.y // CELL
+        self.handle_press(x, y)
+
     def spawn(self):
-        if (self.start_anim or self.wipe or self.countdown
-                or self.round_anim or self.game_over_flag):
+        if self.start_anim or self.wipe or self.countdown or self.round_anim or self.game_over_flag:
             return
 
         spawn_rate = 0.08 + self.round * 0.04
@@ -282,9 +427,9 @@ class Game:
                 x = random.randint(0, BOARD_W - 1)
                 if x != SEP_COL:
                     break
-            y        = random.randint(0, BOARD_H - 1)
+            y = random.randint(0, BOARD_H - 1)
             lifetime = max(1.2, 3 - self.round * 0.6)
-            kind     = random.choice(["target", "trap", "bonus"])
+            kind = random.choice(["target", "trap", "bonus"])
             self.tiles[(x, y)] = (kind, time.time() + lifetime)
 
     def update(self):
@@ -296,26 +441,26 @@ class Game:
         if self.start_anim:
             if now - self.start_time > 3:
                 self.start_anim = False
-                self.wipe       = True
-                self.wipe_x     = 0
+                self.wipe = True
+                self.wipe_x = 0
             return
 
         if self.wipe:
             self.wipe_x += 1
             if self.wipe_x >= BOARD_W:
-                self.wipe           = False
-                self.countdown      = True
-                self.countdown_val  = 3
+                self.wipe = False
+                self.countdown = True
+                self.countdown_val = 3
                 self.countdown_time = time.time()
             return
 
         if self.round_anim:
             self.wave_radius += 1
             if self.wave_radius > max(BOARD_W, BOARD_H):
-                self.round_anim        = False
-                self.countdown         = True
-                self.countdown_val     = 3
-                self.countdown_time    = time.time()
+                self.round_anim = False
+                self.countdown = True
+                self.countdown_val = 3
+                self.countdown_time = time.time()
                 self.countdown_started = False
             return
 
@@ -331,16 +476,20 @@ class Game:
                 self.countdown_val -= 1
                 self.countdown_time = now
             if self.countdown_val < 0:
-                self.countdown   = False
+                self.countdown = False
                 self.round_start = time.time()
             return
+
+        for pos in list(self.tiles.keys()):
+            if self.net.is_pressed(pos[0], pos[1]):
+                self.handle_press(pos[0], pos[1])
 
         if now - self.round_start > self.round_time:
             self.next_round()
             return
 
         for pos in list(self.tiles.keys()):
-            if now > self.tiles[pos][1]:
+            if pos in self.tiles and now > self.tiles[pos][1]:
                 del self.tiles[pos]
 
         for i in range(2):
@@ -354,7 +503,7 @@ class Game:
         if self.round > self.max_rounds:
             self.game_over()
         else:
-            self.round_anim  = True
+            self.round_anim = True
             self.wave_radius = 0
 
     def game_over(self):
@@ -364,28 +513,27 @@ class Game:
         if self.scores[0] > self.scores[1]:
             self.winner_line1 = "P1"
             self.winner_line2 = "WINS"
-            self.winner_col   = P1_COLOR
+            self.winner_col = P1_COLOR
         elif self.scores[1] > self.scores[0]:
             self.winner_line1 = "P2"
             self.winner_line2 = "WINS"
-            self.winner_col   = P2_COLOR
+            self.winner_col = P2_COLOR
         else:
             self.winner_line1 = "DRAW"
             self.winner_line2 = ""
-            self.winner_col   = (255, 255, 255)
+            self.winner_col = WHITE
 
     def draw(self):
         self.canvas.delete("all")
+        self.grid.clear()
 
         if self.game_over_flag:
             self.canvas.create_rectangle(
                 0, 0, BOARD_W * CELL, BOARD_H * CELL,
                 fill="black", outline=""
             )
-            self.draw_pixel_text(
-                self.winner_line1, self.winner_line2,
-                self.winner_col
-            )
+            self.draw_pixel_text(self.winner_line1, self.winner_line2, self.winner_col)
+            self.net.send_frame(self.grid)
             return
 
         if self.start_anim:
@@ -393,16 +541,19 @@ class Game:
             for y in range(BOARD_H):
                 for x in range(BOARD_W):
                     self.led(x, y, self.rainbow(x, y, t))
+            self.net.send_frame(self.grid)
             return
 
         if self.wipe:
             t = time.time()
             for y in range(BOARD_H):
                 for x in range(BOARD_W):
-                    col = (0, 0, 0) if x < self.wipe_x else self.rainbow(x, y, t)
+                    col = BLACK if x < self.wipe_x else self.rainbow(x, y, t)
                     self.led(x, y, col)
-            for y in range(BOARD_H):
-                self.led(self.wipe_x, y, (255, 255, 255))
+            if 0 <= self.wipe_x < BOARD_W:
+                for y in range(BOARD_H):
+                    self.led(self.wipe_x, y, WHITE)
+            self.net.send_frame(self.grid)
             return
 
         if self.round_anim:
@@ -411,9 +562,10 @@ class Game:
             for y in range(BOARD_H):
                 for x in range(BOARD_W):
                     dist = abs(x - cx) + abs(y - cy)
-                    col  = (255, 255, 255) if dist < self.wave_radius else (0, 0, 0)
+                    col = WHITE if dist < self.wave_radius else BLACK
                     self.led(x, y, col)
             self.draw_round_text()
+            self.net.send_frame(self.grid)
             return
 
         if self.countdown:
@@ -423,6 +575,7 @@ class Game:
             )
             key = "GO" if self.countdown_val <= 0 else str(self.countdown_val)
             self.draw_led_text_centered(key)
+            self.net.send_frame(self.grid)
             return
 
         self.canvas.create_rectangle(
@@ -431,13 +584,20 @@ class Game:
         )
 
         self.canvas.create_rectangle(
-            SEP_COL * CELL,       0,
+            SEP_COL * CELL, 0,
             (SEP_COL + 1) * CELL, BOARD_H * CELL,
             fill="white", outline=""
         )
 
+        for y in range(BOARD_H):
+            for x in range(BOARD_W):
+                if x == SEP_COL:
+                    self.grid[(x, y)] = WHITE
+                else:
+                    self.grid[(x, y)] = BLACK
+
         for (x, y), (kind, _) in self.tiles.items():
-            p    = 0 if x < SEP_COL else 1
+            p = 0 if x < SEP_COL else 1
             base = P1_COLOR if p == 0 else P2_COLOR
 
             if kind == "trap":
@@ -448,7 +608,7 @@ class Game:
                 col = base
 
             if self.bonus_active[p] and kind != "trap":
-                col = (255, 255, 255)
+                col = WHITE
 
             self.led(x, y, col)
 
@@ -467,11 +627,12 @@ class Game:
             font=("Courier", 14, "bold")
         )
 
+        self.net.send_frame(self.grid)
+
     def loop(self):
         self.spawn()
         self.update()
         self.draw()
         self.root.after(80, self.loop)
-
 
 Game()

@@ -13,14 +13,14 @@ _CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eye_sim
 
 def _load_config():
     defaults = {
-        "send_port": 7800,
-        "recv_port": 4626,
+        "send_port": 2002,
+        "recv_port": 2003,
         "device_ip": "255.255.255.255",
         "last_used_ports": []
     }
     try:
-        if os.path.exists(_CFG_FILE):
-            with open(_CFG_FILE, encoding="utf-8") as f:
+        if os.path.exists(_CONFIG_FILE):
+            with open(_CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
                 defaults.update(data)
         return defaults
@@ -29,7 +29,7 @@ def _load_config():
 
 def _save_config(config):
     try:
-        with open(_CFG_FILE, 'w', encoding="utf-8") as f:
+        with open(_CONFIG_FILE, 'w', encoding="utf-8") as f:
             json.dump(config, f, indent=4)
     except:
         pass
