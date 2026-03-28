@@ -12,6 +12,8 @@ import os
 import json
 from matrix_font import FONT_5x7
 from small_font import FONT_3x5
+# Game integration
+from memory_maze_game import GameState
 
 # --- Constants ---
 UDP_SEND_IP = "255.255.255.255"
@@ -29,8 +31,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix_ctr
 def _load_config():
     defaults = {
         "device_ip": "255.255.255.255",
-        "send_port": 4626,
-        "recv_port": 7800,
+        "send_port": 2000,
+        "recv_port": 2001,
         "auto_start_streaming": False,
         "last_used_ports": []
     }
@@ -71,7 +73,8 @@ class NetworkManager:
         self.sequence_number = 0
         self.bind_ip = "0.0.0.0"
         self.target_ip = CONFIG.get("device_ip", "255.255.255.255")
-        self.send_port = CONFIG.get("send_port", 4626)
+        self.send_port = CONFIG.get("send_port", 2000)
+
         
         # Priority: Auto-detecting 169.254 (for hardware)
 
@@ -264,13 +267,19 @@ class MatrixGUI:
         # Setup Network
         self.network = NetworkManager()
         self.send_lock = threading.Lock()
+
+        # Game state and synchronization lock
+        # GameState starts in LOBBY phase; player count is chosen on the floor.
+        # Call self.game_state.set_player_count(n) to start directly from code.
+        self.game_state = GameState()
+        self.game_lock = threading.Lock()
         
         # Trigger States: dict mapping (ch, led) to bool
         self.trigger_states = {}
         
         # Initialize port variables BEFORE binding
-        self.port_out_var = tk.StringVar(value=str(CONFIG.get("send_port", 4626)))
-        self.port_in_var = tk.StringVar(value=str(CONFIG.get("recv_port", 7800)))
+        self.port_out_var = tk.StringVar(value=str(CONFIG.get("send_port", 2000)))
+        self.port_in_var  = tk.StringVar(value=str(CONFIG.get("recv_port", 2001)))
 
         self.receiver_running = True
         self.sock_recv = None
@@ -403,6 +412,7 @@ class MatrixGUI:
         except Exception as e:
             print(f"Matrix_GUI: Failed to bind trigger receiver to {p_in}: {e}")
 
+    '''
     def receiver_loop(self):
         while self.receiver_running:
             try:
@@ -425,6 +435,61 @@ class MatrixGUI:
                 continue
             except Exception as e:
                 print(f"Receiver error: {e}")
+    '''
+
+    def receiver_loop(self):
+        """
+        Receiver loop: parse incoming trigger packets and notify the game on
+        both rising edges (press) and falling edges (release).
+        """
+        while self.receiver_running:
+            try:
+                data, addr = self.sock_recv.recvfrom(2048)
+                if len(data) >= 1373 and data[0] == 0x88:
+                    changed = False
+                    for ch in range(8):
+                        base = 2 + ch * 171
+                        for led in range(64):
+                            try:
+                                current_state = (data[base + 1 + led] == 0xCC)
+                            except IndexError:
+                                current_state = False
+
+                            prev_state = self.trigger_states.get((ch, led), False)
+                            if prev_state != current_state:
+                                self.trigger_states[(ch, led)] = current_state
+                                changed = True
+                                print(f"Matrix_GUI trigger ch={ch} led={led} state={current_state}")
+
+                                try:
+                                    touch_index = self.ch_led_to_touch_index(ch, led)
+                                    try:
+                                        self.game_lock.acquire()
+                                        if current_state:
+                                            # Rising edge → press
+                                            self.game_state.on_touch(touch_index)
+                                        else:
+                                            # Falling edge → release
+                                            self.game_state.on_release(touch_index)
+                                    finally:
+                                        self.game_lock.release()
+                                except Exception as e:
+                                    print("Error dispatching touch/release:", e)
+
+                    if changed:
+                        try:
+                            self.root.after(0, self.draw_grid)
+                        except Exception:
+                            pass
+
+                elif data and data[0] == 0x88:
+                    print(f"Matrix_GUI DROPPED 0x88 packet (len={len(data)})")
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Receiver error: {e}")
+
 
     def _update_iface_list(self):
         ips = ["0.0.0.0", "127.0.0.1"]
@@ -507,7 +572,7 @@ class MatrixGUI:
         self.is_sending = not self.is_sending
         if self.is_sending:
             self.btn_send.config(text="STOP STREAM", bg="red")
-            t = threading.Thread(target=self.sending_loop)
+            t = threading.Thread(target=self.game_sending_loop)
             t.daemon = True
             t.start()
         else:
@@ -531,6 +596,52 @@ class MatrixGUI:
             buffer[offset] = color[1] # Green/Red Swap
             buffer[offset + NUM_CHANNELS] = color[0] # Green/Red Swap
             buffer[offset + NUM_CHANNELS*2] = color[2]
+
+    # Adapter: paint logical (x,y) -> hardware buffer layout used by NetworkManager.send_packet
+    class FrameWriterAdapter:
+        def __init__(self):
+            self.buffer = bytearray(FRAME_DATA_LENGTH)
+
+        def clear(self):
+            for i in range(len(self.buffer)):
+                self.buffer[i] = 0
+
+        def set_pixel(self, x, y, r, g, b):
+            # Use same mapping as set_led but write into self.buffer
+            if x < 0 or x >= 16: return
+            channel = y // 4
+            if channel >= 8: return
+            row_in_channel = y % 4
+            if row_in_channel % 2 == 0:
+                led_index = row_in_channel * 16 + x
+            else:
+                led_index = row_in_channel * 16 + (15 - x)
+            block_size = NUM_CHANNELS * 3
+            offset = led_index * block_size + channel
+            if offset + NUM_CHANNELS*2 < len(self.buffer):
+                # GRB ordering (your code uses buffer[offset]=G, offset+NUM_CHANNELS=R, offset+2*NUM_CHANNELS=B)
+                self.buffer[offset] = g & 0xFF
+                self.buffer[offset + NUM_CHANNELS] = r & 0xFF
+                self.buffer[offset + NUM_CHANNELS*2] = b & 0xFF
+
+        def get_bytes(self):
+            return bytes(self.buffer)
+        
+    def ch_led_to_touch_index(self, ch: int, led: int) -> int:
+        """
+        Map hardware (ch: 0-7, led: 0-63) to a linear tile index on the
+        16×32 board:  index = y * BOARD_WIDTH + x
+
+        Inverse of Simulator._xy_to_ch_led:
+            ch  = y // 4
+            row = y % 4
+            led = row*16 + x           (even rows, left-to-right)
+                = row*16 + (15 - x)    (odd  rows, right-to-left)
+        """
+        row_in_ch = led // 16
+        y = ch * 4 + row_in_ch
+        x = (led % 16) if row_in_ch % 2 == 0 else (15 - (led % 16))
+        return max(0, min(BOARD_HEIGHT * BOARD_WIDTH - 1, y * BOARD_WIDTH + x))
 
     def render_frame(self):
         buffer = bytearray(FRAME_DATA_LENGTH)
@@ -683,6 +794,80 @@ class MatrixGUI:
             return self.grid_data
 
         return frame_grid
+    
+    # Replace or add this sending loop in MatrixGUI
+    def game_sending_loop(self):
+        writer = self.FrameWriterAdapter()   # FIX: inner class needs self. prefix
+        last_time = time.time()
+        while self.is_sending:
+            now = time.time()
+            dt = now - last_time
+            last_time = now
+
+            # 1) Update game logic
+            try:
+                self.game_state.update(dt)
+            except Exception as e:
+                print("Game update error:", e)
+
+            # 2) Paint into writer
+            try:
+                self.game_state.build_frame(writer)
+            except Exception as e:
+                print("Frame build error:", e)
+
+            # 3) Decode writer buffer → self.grid_data so the canvas preview shows the game
+            try:
+                self._sync_grid_from_writer(writer)
+            except Exception as e:
+                print("Grid sync error:", e)
+
+            # 4) Send raw bytes using existing network manager
+            try:
+                frame_bytes = writer.get_bytes()
+                self.network.send_packet(frame_bytes)
+            except Exception as e:
+                print("Network send error:", e)
+
+            # 5) Redraw canvas on main thread every frame
+            try:
+                self.root.after(0, self.draw_grid)
+            except Exception:
+                pass
+
+            self.time_counter += 1
+            time.sleep(0.05)  # ~20 FPS
+
+    def _sync_grid_from_writer(self, writer):
+        """
+        Decode the hardware-layout byte buffer back into self.grid_data
+        so the Controller canvas preview reflects the live game state.
+
+        Inverse of FrameWriterAdapter.set_pixel:
+            offset = led_index * 24 + channel
+            buffer[offset]      = G
+            buffer[offset + 8]  = R
+            buffer[offset + 16] = B
+
+            led_index = row_in_ch * 16 + x   (even rows)
+                      = row_in_ch * 16 + (15-x) (odd rows)
+            y = channel * 4 + row_in_ch
+        """
+        buf = writer.buffer
+        for led_index in range(LEDS_PER_CHANNEL):
+            row_in_ch = led_index // 16
+            led_x     = led_index % 16
+            for channel in range(NUM_CHANNELS):
+                offset = led_index * NUM_CHANNELS * 3 + channel
+                if offset + NUM_CHANNELS * 2 >= len(buf):
+                    continue
+                g_val = buf[offset]
+                r_val = buf[offset + NUM_CHANNELS]
+                b_val = buf[offset + NUM_CHANNELS * 2]
+                x = led_x if row_in_ch % 2 == 0 else (15 - led_x)
+                y = channel * 4 + row_in_ch
+                if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+                    self.grid_data[(x, y)] = (r_val, g_val, b_val)
 
     def sending_loop(self):
         while self.is_sending:
