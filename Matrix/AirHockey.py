@@ -3,6 +3,17 @@ import threading
 import time
 import random
 import math
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    import pygame
+    pygame.mixer.init()
+    HAS_AUDIO = True
+except Exception as e:
+    print(f"Eroare initializare audio: {e}")
+    HAS_AUDIO = False
 
 # Constante
 BOARD_LENGTH      = 32
@@ -12,18 +23,20 @@ LEDS_PER_CHANNEL  = 64
 FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
 
 UDP_TARGET_IP = "255.255.255.255"
-UDP_SEND_PORT = 2000
-UDP_RECV_PORT = 2001
+UDP_SEND_PORT = 4626
+UDP_RECV_PORT = 7800
 
 # Culori
-BLACK    = (0,   0,   0)
+#BLACK    = (0,   0,   0)
+BLACK = (0,0,0)
 WHITE    = (255, 255, 255)
 RED      = (200, 0,   0)
-YELLOW   = (255, 255, 0)
-DARK_RED = (60,  0,   0)
+#YELLOW   = (255, 255, 0)
+#DARK_RED = (60,  0,   0)
+DARK_RED = (15,15,50)
 PURPLE   = (178, 102, 255)
 ORANGE   = (255, 130, 0)
-GRAY     = (25,  25,  25)
+#GRAY     = (25,  25,  25)
 BORDER   = (15,  15,  50)
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -56,8 +69,8 @@ CENTER_X    = BOARD_WIDTH // 2
 CENTER_Y    = (PLAY_TOP + PLAY_BOTTOM) // 2
 
 # Control columns
-CTRL_LEFT_COLS  = [1, 2, 3, 4]
-CTRL_RIGHT_COLS = [11, 12, 13, 14]
+CTRL_LEFT_COLS  = [2, 3, 4, 5]
+CTRL_RIGHT_COLS = [10, 11, 12, 13]
 
 # Arrow pixel patterns (3 rows x 4 cols)
 # ARROW_R points RIGHT →
@@ -73,24 +86,28 @@ ARROW_L = [
     [0, 1, 0, 0],
 ]
 
-ARROW_LEFT_START  = 1   # cols 1-4
-ARROW_RIGHT_START = 11  # cols 11-14
+ARROW_LEFT_START  = 2   # cols 2-5
+ARROW_RIGHT_START = 10  # cols 10-13
 
 FONT_5x7 = {
-    '0': [62, 65, 65,  65, 62],
-    '1': [0,  66, 127, 64, 0],
-    '2': [98, 81, 73,  69, 70],
-    '3': [34, 65, 73,  73, 54],
-    'G': [62, 65, 73,  73, 46],
-    'O': [62, 65, 65,  65, 62],
-    '!': [0,  0,  95,  0,  0]
+    '0': [0x3E, 0x51, 0x49, 0x45, 0x3E],
+    '1': [0x00, 0x42, 0x7F, 0x40, 0x00],
+    '2': [0x42, 0x61, 0x51, 0x49, 0x46],
+    '3': [0x21, 0x41, 0x45, 0x4B, 0x31],
+    '4': [0x18, 0x14, 0x12, 0x7F, 0x10],
+    '5': [0x27, 0x45, 0x45, 0x45, 0x39]
 }
 
-def draw_char(g, char, x, y, color):
+def draw_char(g, char, x, y, color, flip=False):
     for ci, col_byte in enumerate(FONT_5x7.get(char, [0,0,0,0,0])):
         for ri in range(7):
             if (col_byte >> ri) & 1:
-                px, py = int(x + ci), int(y + ri)
+                if flip:
+                    # Rotire 180 grade: inversăm și pe X și pe Y (4 și 6 sunt limitele pentru fontul 5x7)
+                    px, py = int(x + (4 - ci)), int(y + (6 - ri))
+                else:
+                    px, py = int(x + ci), int(y + ri)
+
                 if 0 <= px < BOARD_WIDTH and 0 <= py < BOARD_LENGTH:
                     g[(px, py)] = color
 
@@ -211,7 +228,7 @@ class HockeyGame:
         self.state      = "countdown"
         self.anim_timer = 0.0
         self.goal_team  = 0
-        self.countdown_n= 3
+        self.countdown_n= -1
 
         self.paddle_e1  = float(CENTER_X)
         self.paddle_e2  = float(CENTER_X)
@@ -257,7 +274,7 @@ class HockeyGame:
 
     def _clamp_paddle(self, cx):
         half = self.paddle_len / 2.0
-        return max(1 + half, min(14 - half, cx))
+        return max(1 + half, min(15 - half, cx))
 
     def _paddle_tiles(self, cx):
         start = int(round(cx - self.paddle_len / 2.0))
@@ -286,35 +303,51 @@ class HockeyGame:
             nx = 14.0; self.ball_dx = -abs(self.ball_dx)
 
         # Paddle E2 (ball going UP)
-        if self.ball_dy < 0 and ny <= PADDLE_ROW_E2 and self.ball_y > PADDLE_ROW_E2:
-            if int(round(nx)) in self._paddle_tiles(self.paddle_e2):
-                ny = PADDLE_ROW_E2 + 0.5
+        paddle_e2_tiles = self._paddle_tiles(self.paddle_e2)
+
+        if int(round(nx)) in paddle_e2_tiles:
+            if self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_E2 and ny <= PADDLE_ROW_E2 + 0.55:
+                ny = PADDLE_ROW_E2 + 0.55
                 self.ball_dy = abs(self.ball_dy)
+                self._deflect(nx, self.paddle_e2)
+                self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
+            elif self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_E2 and ny >= PADDLE_ROW_E2 - 0.55:
+                ny = PADDLE_ROW_E2 - 0.55
+                self.ball_dy = -abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e2)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
 
         # Paddle E1 (ball going DOWN)
-        if self.ball_dy > 0 and ny >= PADDLE_ROW_E1 and self.ball_y < PADDLE_ROW_E1:
-            if int(round(nx)) in self._paddle_tiles(self.paddle_e1):
-                ny = PADDLE_ROW_E1 - 0.5
+        paddle_e1_tiles = self._paddle_tiles(self.paddle_e1)
+        if int(round(nx)) in paddle_e1_tiles:
+            if self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_E1 and ny >= PADDLE_ROW_E1 - 0.55:
+                ny = PADDLE_ROW_E1 - 0.55
                 self.ball_dy = -abs(self.ball_dy)
+                self._deflect(nx, self.paddle_e1)
+                self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
+            elif self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_E1 and ny <= PADDLE_ROW_E1 + 0.55:
+                ny = PADDLE_ROW_E1 + 0.55
+                self.ball_dy = abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e1)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
 
         # Goal E2 (ball going UP past goal row)
-        if ny <= GOAL_ROW_E2:
+        if ny <= GOAL_ROW_E2 + 0.55:
             if int(round(nx)) in GOAL_COLS:
-                self._score(scorer=0); return
+                if ny <= GOAL_ROW_E2:  # Intră complet în poartă
+                    self._score(scorer=0); return
             else:
-                ny = float(GOAL_ROW_E2) + 0.5
+                ny = float(GOAL_ROW_E2) + 0.55
                 self.ball_dy = abs(self.ball_dy)
 
         # Goal E1 (ball going DOWN past goal row)
-        if ny >= GOAL_ROW_E1:
+        if ny >= GOAL_ROW_E1 - 0.55:
             if int(round(nx)) in GOAL_COLS:
-                self._score(scorer=1); return
+                if ny >= GOAL_ROW_E1:  # Intră complet în poartă
+                    self._score(scorer=1);
+                    return
             else:
-                ny = float(GOAL_ROW_E1) - 0.5
+                ny = float(GOAL_ROW_E1) - 0.55
                 self.ball_dy = -abs(self.ball_dy)
 
         self.ball_x, self.ball_y = nx, ny
@@ -330,16 +363,20 @@ class HockeyGame:
     def _score(self, scorer):
         self.score[scorer] += 1
         self.goal_team  = scorer
-        self.state      = "goal_anim"
+        #self.state      = "goal_anim"
         self.anim_timer = 0.0
+
+        if max(self.score) >= self.max_goals:
+            self.state = "victory"
+            self._play_sound("bgm.wav")
+        else:
+            self.state = "goal_anim"
+            self._play_sound("line.wav")
 
     def _update_goal_anim(self, dt):
         self.anim_timer += dt
         if self.anim_timer >= 2.5:
-            if max(self.score) >= self.max_goals:
-                self.state = "victory"; self.anim_timer = 0.0
-            else:
-                self._start_countdown()
+            self._start_countdown()
 
     def _start_countdown(self):
         towards = -1 if self.goal_team == 0 else 1
@@ -347,10 +384,20 @@ class HockeyGame:
         self.ball_speed = self.base_speed
         self.state      = "countdown"
         self.anim_timer = 0.0
+        self.countdown_n = -1
 
     def _update_countdown(self, dt):
-        self.anim_timer  += dt
-        self.countdown_n  = max(0, 3 - int(self.anim_timer))
+        old_n = self.countdown_n
+        self.anim_timer += dt
+        self.countdown_n = max(0, 3 - int(self.anim_timer))
+
+        # Redăm sunetele doar când numărul se schimbă (de ex. de la 3 la 2)
+        if self.countdown_n != old_n:
+            if self.countdown_n > 0:
+                self._play_sound("countdown_beep.wav")
+            elif self.countdown_n == 0 and old_n == 1:  # Tranziția din 1 în GO!
+                self._play_sound("countdown_go.wav")
+
         if self.anim_timer >= 4.0:
             self.state = "playing"
 
@@ -378,7 +425,7 @@ class HockeyGame:
         # Goals
         dim_orange = (ORANGE[0] // 3, ORANGE[1] // 3, ORANGE[2] // 3)
         dim_purple = (PURPLE[0] // 3, PURPLE[1] // 3, PURPLE[2] // 3)
-        draw_char(g, str(self.score[1]), 5, 8, dim_orange)
+        draw_char(g, str(self.score[1]), 5, 8, dim_orange, flip=True)
         draw_char(g, str(self.score[0]), 5, 17, dim_purple)
 
         for x in range(BOARD_WIDTH):
@@ -417,13 +464,14 @@ class HockeyGame:
             g[(x, PADDLE_ROW_E1)] = PURPLE
 
         # Center dot
-        g[(CENTER_X, CENTER_Y)] = GRAY
+        #g[(CENTER_X, CENTER_Y)] = GRAY
 
         # Puck
-        bx = int(round(self.ball_x))
-        by = int(round(self.ball_y))
-        if 0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_LENGTH:
-            g[(bx, by)] = WHITE
+        if self.state not in ["goal_anim", "victory"]:
+            bx = int(round(self.ball_x))
+            by = int(round(self.ball_y))
+            if 0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_LENGTH:
+                g[(bx, by)] = WHITE
 
         # Score dots
         #for i in range(self.score[1]):   # E2 top, row 0
@@ -432,208 +480,243 @@ class HockeyGame:
         #    if i < 5: g[(3 + i*2, 31)] = PURPLE
 
     def _render_goal_flash(self, g):
-        col = PURPLE if self.goal_team == 0 else ORANGE
+        # 1. Desenăm terenul normal (ca în timpul jocului)
+        self._render_field(g)
+
+        # 2. Peste el, adăugăm efectul de clipire doar pe scor
         flash = (int(self.anim_timer * 6) % 2 == 0)
-        fill  = col if flash else BLACK
-        for k in g: g[k] = fill
-        #for i in range(self.score[1]):
-        #    if i < 5: g[(3+i*2, 0)]  = ORANGE
-        #for i in range(self.score[0]):
-        #    if i < 5: g[(3+i*2, 31)] = PURPLE
-        draw_char(g, str(self.score[1]), 5, 8, ORANGE)
-        draw_char(g, str(self.score[0]), 5, 17, PURPLE)
+
+        if self.goal_team == 0:  # Dacă a marcat Echipa 1 (Jos / Mov)
+            # Desenăm scorul mov aprins dacă e pe flash, altfel ștergem complet zona aia (negru)
+            col = PURPLE if flash else BLACK
+            draw_char(g, str(self.score[0]), 5, 17, col)
+        elif self.goal_team == 1:  # Dacă a marcat Echipa 2 (Sus / Portocaliu)
+            # Desenăm scorul portocaliu aprins dacă e pe flash, altfel ștergem
+            col = ORANGE if flash else BLACK
+            draw_char(g, str(self.score[1]), 5, 8, col, flip=True)
 
     def _render_countdown(self, g):
-        n = self.countdown_n
-        if n > 0:
-            draw_char(g, str(n), CENTER_X - 2, CENTER_Y - 3, WHITE)
-        elif n == 0:
-            y_pos = CENTER_Y - 3  # Aceeași poziție pe verticală
-
-            draw_char(g, 'G', 0, y_pos, WHITE)
-            draw_char(g, 'O', 5, y_pos, WHITE)
-
-            # Notă: Deși blocul '!' începe la X=10,
-            # semnul vizual va apărea la X=12 datorită datelor din font.
-            draw_char(g, '!', 10, y_pos, WHITE)
+        #n = self.countdown_n
+        #if n > 0:
+        #    draw_char(g, str(n), CENTER_X - 2, CENTER_Y - 3, WHITE)
+        #elif n == 0:
+        #    y_pos = CENTER_Y - 3  # Aceeași poziție pe verticală
+        #
+        #    draw_char(g, 'G', 0, y_pos, WHITE)
+        #    draw_char(g, 'O', 5, y_pos, WHITE)
+        #
+        #    # Notă: Deși blocul '!' începe la X=10,
+        #    # semnul vizual va apărea la X=12 datorită datelor din font.
+        #    draw_char(g, '!', 10, y_pos, WHITE)
+        pass
 
     def _render_victory(self, g):
-        col   = PURPLE if self.score[0] > self.score[1] else ORANGE
+        self._render_field(g)  # Păstrăm terenul pe fundal
         flash = (int(self.anim_timer * 4) % 2 == 0)
-        for k in g: g[k] = col if flash else BLACK
+
+        # Dacă flash e True aprindem tare cifrele, dacă e False le facem negre (le stingem)
+        col_e2 = ORANGE if flash else BLACK
+        col_e1 = PURPLE if flash else BLACK
         #for i in range(self.score[1]):
         #    if i < 5: g[(3+i*2, 0)]  = ORANGE
         #for i in range(self.score[0]):
         #    if i < 5: g[(3+i*2, 31)] = PURPLE
-        draw_char(g, str(self.score[1]), 5, 8, ORANGE)
-        draw_char(g, str(self.score[0]), 5, 17, PURPLE)
+        draw_char(g, str(self.score[1]), 5, 8, col_e2, flip=True)
+        draw_char(g, str(self.score[0]), 5, 17, col_e1)
+
+    def _play_sound(self, filename):
+        if HAS_AUDIO:
+            path = os.path.join(BASE_DIR, "_sfx", filename)
+            if os.path.exists(path):
+                try:
+                    # Salvăm sunetul într-un dicționar ca Python să nu îl șteargă instant
+                    if not hasattr(self, 'loaded_sounds'):
+                        self.loaded_sounds = {}
+                    if filename not in self.loaded_sounds:
+                        self.loaded_sounds[filename] = pygame.mixer.Sound(path)
+
+                    self.loaded_sounds[filename].play()
+                except Exception as e:
+                    print(f"Eroare redare audio: {e}")
+            else:
+                print(f"Fisier audio lipsa: {path}")
 
 # ─── Config UI ────────────────────────────────────────────────────────────────
-def run_config_ui():
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except ImportError:
-        return {"max_goals":5,"speed":"normal","paddle_len":4,
-                "team1_name":"Team 1","team2_name":"Team 2"}
+#def run_config_ui():
+#    try:
+#        import tkinter as tk
+#        from tkinter import ttk
+#    except ImportError:
+#        return {"max_goals":5,"speed":"normal","paddle_len":4,
+#                "team1_name":"Team 1","team2_name":"Team 2"}
+#
+#    result = {}
+#    root = tk.Tk()
+#    root.title("🏒 Floor Hockey — Setup")
+#    root.configure(bg="#111")
+#    root.resizable(False, False)
+#
+#    def lbl(text, row):
+#        tk.Label(root, text=text, bg="#111", fg="#aaa",
+#                 font=("Consolas", 11)).grid(row=row, column=0,
+#                 sticky="w", padx=20, pady=8)
 
-    result = {}
-    root = tk.Tk()
-    root.title("🏒 Floor Hockey — Setup")
-    root.configure(bg="#111")
-    root.resizable(False, False)
-
-    def lbl(text, row):
-        tk.Label(root, text=text, bg="#111", fg="#aaa",
-                 font=("Consolas", 11)).grid(row=row, column=0,
-                 sticky="w", padx=20, pady=8)
-
-    lbl("Goals to win:", 0)
-    goals_v = tk.StringVar(value="5")
-    ttk.Combobox(root, textvariable=goals_v, values=["3","5","7"],
-                 width=10, state="readonly").grid(row=0, column=1, padx=10)
-
-    lbl("Ball speed:", 1)
-    speed_v = tk.StringVar(value="normal")
-    ttk.Combobox(root, textvariable=speed_v, values=["slow","normal","fast"],
-                 width=10, state="readonly").grid(row=1, column=1, padx=10)
-
-    lbl("Paddle length:", 2)
-    paddle_v = tk.StringVar(value="4")
-    ttk.Combobox(root, textvariable=paddle_v, values=["3","4","5"],
-                 width=10, state="readonly").grid(row=2, column=1, padx=10)
-
-    lbl("Team 1 (bottom / PURPLE):", 3)
-    t1_v = tk.StringVar(value="Team 1")
-    tk.Entry(root, textvariable=t1_v, bg="#222", fg="white",
-             font=("Consolas", 10), insertbackground="white"
-             ).grid(row=3, column=1, padx=10)
-
-    lbl("Team 2 (top / orange):", 4)
-    t2_v = tk.StringVar(value="Team 2")
-    tk.Entry(root, textvariable=t2_v, bg="#222", fg="white",
-             font=("Consolas", 10), insertbackground="white"
-             ).grid(row=4, column=1, padx=10)
-
-    cancelled = [False]
-
-    def start():
-        result.update({
-            "max_goals":  int(goals_v.get()),
-            "speed":      speed_v.get(),
-            "paddle_len": int(paddle_v.get()),
-            "team1_name": t1_v.get() or "Team 1",
-            "team2_name": t2_v.get() or "Team 2",
-        })
-        root.destroy()
-
-    def cancel():
-        cancelled[0] = True; root.destroy()
-
-    bf = tk.Frame(root, bg="#111")
-    bf.grid(row=5, column=0, columnspan=2, pady=15)
-    tk.Button(bf, text="▶  START GAME", command=start,
-              bg="#224488", fg="white", font=("Consolas", 12, "bold"),
-              relief="flat", padx=20, pady=8).pack(side=tk.LEFT, padx=8)
-    tk.Button(bf, text="Cancel", command=cancel,
-              bg="#333", fg="white", font=("Consolas", 10),
-              relief="flat", padx=10, pady=8).pack(side=tk.LEFT, padx=8)
-
-    root.mainloop()
-    return None if (cancelled[0] or not result) else result
+#    lbl("Goals to win:", 0)
+#    goals_v = tk.StringVar(value="5")
+#    ttk.Combobox(root, textvariable=goals_v, values=["3","5","7"],
+#                 width=10, state="readonly").grid(row=0, column=1, padx=10)
+#
+#    lbl("Ball speed:", 1)
+#    speed_v = tk.StringVar(value="normal")
+#    ttk.Combobox(root, textvariable=speed_v, values=["slow","normal","fast"],
+#                 width=10, state="readonly").grid(row=1, column=1, padx=10)
+#
+#    lbl("Paddle length:", 2)
+#    paddle_v = tk.StringVar(value="4")
+#    ttk.Combobox(root, textvariable=paddle_v, values=["3","4","5"],
+#                 width=10, state="readonly").grid(row=2, column=1, padx=10)
+#
+#    lbl("Team 1 (bottom / PURPLE):", 3)
+#    t1_v = tk.StringVar(value="Team 1")
+#    tk.Entry(root, textvariable=t1_v, bg="#222", fg="white",
+#             font=("Consolas", 10), insertbackground="white"
+#            ).grid(row=3, column=1, padx=10)
+#
+#    lbl("Team 2 (top / orange):", 4)
+#    t2_v = tk.StringVar(value="Team 2")
+#    tk.Entry(root, textvariable=t2_v, bg="#222", fg="white",
+#             font=("Consolas", 10), insertbackground="white"
+#             ).grid(row=4, column=1, padx=10)
+#
+#    cancelled = [False]
+#
+#    def start():
+#        result.update({
+#            "max_goals":  int(goals_v.get()),
+#            "speed":      speed_v.get(),
+#            "paddle_len": int(paddle_v.get()),
+#            "team1_name": t1_v.get() or "Team 1",
+#            "team2_name": t2_v.get() or "Team 2",
+#        })
+#        root.destroy()
+#
+#    def cancel():
+#        cancelled[0] = True; root.destroy()
+#
+#    bf = tk.Frame(root, bg="#111")
+#    bf.grid(row=5, column=0, columnspan=2, pady=15)
+#    tk.Button(bf, text="▶  START GAME", command=start,
+#              bg="#224488", fg="white", font=("Consolas", 12, "bold"),
+#              relief="flat", padx=20, pady=8).pack(side=tk.LEFT, padx=8)
+#    tk.Button(bf, text="Cancel", command=cancel,
+#              bg="#333", fg="white", font=("Consolas", 10),
+#              relief="flat", padx=10, pady=8).pack(side=tk.LEFT, padx=8)
+#
+#    root.mainloop()
+#    return None if (cancelled[0] or not result) else result
 
 # ─── Second monitor ───────────────────────────────────────────────────────────
-def run_display(game_ref, config):
-    try:
-        import pygame
-    except ImportError:
-        print("pygame not available — skipping second monitor."); return
-
-    pygame.init()
-    screen = pygame.display.set_mode((800, 480))
-    pygame.display.set_caption("🏒 Floor Hockey")
-    clock  = pygame.time.Clock()
-
-    FH = pygame.font.SysFont("Arial", 160, bold=True)
-    FL = pygame.font.SysFont("Arial", 64,  bold=True)
-    FM = pygame.font.SysFont("Arial", 36)
-    FS = pygame.font.SysFont("Arial", 24)
-
-    T1  = config.get("team1_name", "Team 1")
-    T2  = config.get("team2_name", "Team 2")
-    C1  = (0, 200, 255)
-    C2  = (255, 140, 0)
-    BG  = (12, 12, 22)
-    WH  = (255, 255, 255)
-
-    while True:
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT: pygame.quit(); return
-            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                pygame.quit(); return
-
-        game = game_ref[0]
-        if not game: clock.tick(30); continue
-
-        screen.fill(BG)
-        W, H = screen.get_size()
-        s0, s1 = game.score
-
-        if game.state == "victory":
-            wc    = C1 if s0 > s1 else C2
-            wname = T1 if s0 > s1 else T2
-            flash = (int(game.anim_timer * 3) % 2 == 0)
-            screen.fill(wc if flash else BG)
-            screen.blit(t := FL.render(f"🏆  {wname} WINS!", True, WH),
-                        t.get_rect(center=(W//2, H//2 - 50)))
-            screen.blit(t := FM.render(f"{s0}  —  {s1}", True, (200,200,200)),
-                        t.get_rect(center=(W//2, H//2 + 40)))
-
-        elif game.state == "goal_anim":
-            sc    = C1 if game.goal_team == 0 else C2
-            sname = T1 if game.goal_team == 0 else T2
-            flash = (int(game.anim_timer * 6) % 2 == 0)
-            screen.fill(sc if flash else BG)
-            screen.blit(t := FL.render("⚽  GOAL!", True, WH),
-                        t.get_rect(center=(W//2, H//2 - 60)))
-            screen.blit(t := FM.render(sname, True, sc if not flash else WH),
-                        t.get_rect(center=(W//2, H//2 + 20)))
-            screen.blit(t := FS.render(f"{s0}  —  {s1}", True, (180,180,180)),
-                        t.get_rect(center=(W//2, H//2 + 75)))
-
-        elif game.state == "countdown":
-            n = game.countdown_n
-            screen.blit(t := FH.render(str(s0), True, C1), t.get_rect(center=(W//2-150, H//2+20)))
-            screen.blit(t := FH.render("—",     True, (50,50,50)), t.get_rect(center=(W//2, H//2+20)))
-            screen.blit(t := FH.render(str(s1), True, C2), t.get_rect(center=(W//2+150, H//2+20)))
-            if n > 0:
-                screen.blit(t := FL.render(str(n), True, WH), t.get_rect(center=(W//2, 80)))
-
-        else:  # playing
-            screen.blit(t := FM.render(T1, True, C1), t.get_rect(midleft=(40, H//2-60)))
-            screen.blit(t := FM.render(T2, True, C2), t.get_rect(midright=(W-40, H//2-60)))
-            screen.blit(t := FH.render(str(s0), True, C1), t.get_rect(center=(W//2-150, H//2+20)))
-            screen.blit(t := FH.render("—",     True, (50,50,50)), t.get_rect(center=(W//2, H//2+20)))
-            screen.blit(t := FH.render(str(s1), True, C2), t.get_rect(center=(W//2+150, H//2+20)))
-            screen.blit(t := FS.render(f"First to {game.max_goals} goals", True, (60,60,60)),
-                        t.get_rect(center=(W//2, H-30)))
-
-        pygame.display.flip()
-        clock.tick(30)
+#def run_display(game_ref, config):
+#    try:
+#        import pygame
+#    except ImportError:
+#       print("pygame not available — skipping second monitor."); return
+#
+#    pygame.init()
+#    screen = pygame.display.set_mode((800, 480))
+#    pygame.display.set_caption("🏒 Floor Hockey")
+#    clock  = pygame.time.Clock()
+#
+#    FH = pygame.font.SysFont("Arial", 160, bold=True)
+#    FL = pygame.font.SysFont("Arial", 64,  bold=True)
+#    FM = pygame.font.SysFont("Arial", 36)
+#   FS = pygame.font.SysFont("Arial", 24)
+#
+#    T1  = config.get("team1_name", "Team 1")
+#    T2  = config.get("team2_name", "Team 2")
+#    C1  = (0, 200, 255)
+#    C2  = (255, 140, 0)
+#    BG  = (12, 12, 22)
+#    WH  = (255, 255, 255)
+#
+#    while True:
+#        for ev in pygame.event.get():
+#            if ev.type == pygame.QUIT: pygame.quit(); return
+#            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+#                pygame.quit(); return
+#
+#        game = game_ref[0]
+#        if not game: clock.tick(30); continue
+#
+#        screen.fill(BG)
+#        W, H = screen.get_size()
+#        s0, s1 = game.score
+#
+#        if game.state == "victory":
+#            wc    = C1 if s0 > s1 else C2
+#            wname = T1 if s0 > s1 else T2
+#            flash = (int(game.anim_timer * 3) % 2 == 0)
+#            screen.fill(wc if flash else BG)
+#            screen.blit(t := FL.render(f"🏆  {wname} WINS!", True, WH),
+#                        t.get_rect(center=(W//2, H//2 - 50)))
+#            screen.blit(t := FM.render(f"{s0}  —  {s1}", True, (200,200,200)),
+#                        t.get_rect(center=(W//2, H//2 + 40)))
+#
+#        elif game.state == "goal_anim":
+#            sc    = C1 if game.goal_team == 0 else C2
+#            sname = T1 if game.goal_team == 0 else T2
+#            flash = (int(game.anim_timer * 6) % 2 == 0)
+#            screen.fill(sc if flash else BG)
+#            screen.blit(t := FL.render("⚽  GOAL!", True, WH),
+#                        t.get_rect(center=(W//2, H//2 - 60)))
+#            screen.blit(t := FM.render(sname, True, sc if not flash else WH),
+#                        t.get_rect(center=(W//2, H//2 + 20)))
+#           screen.blit(t := FS.render(f"{s0}  —  {s1}", True, (180,180,180)),
+#                        t.get_rect(center=(W//2, H//2 + 75)))
+#
+#        elif game.state == "countdown":
+#            n = game.countdown_n
+#            screen.blit(t := FH.render(str(s0), True, C1), t.get_rect(center=(W//2-150, H//2+20)))
+#            screen.blit(t := FH.render("—",     True, (50,50,50)), t.get_rect(center=(W//2, H//2+20)))
+#            screen.blit(t := FH.render(str(s1), True, C2), t.get_rect(center=(W//2+150, H//2+20)))
+#            if n > 0:
+#                screen.blit(t := FL.render(str(n), True, WH), t.get_rect(center=(W//2, 80)))
+#
+#        else:  # playing
+#            screen.blit(t := FM.render(T1, True, C1), t.get_rect(midleft=(40, H//2-60)))
+#            screen.blit(t := FM.render(T2, True, C2), t.get_rect(midright=(W-40, H//2-60)))
+#            screen.blit(t := FH.render(str(s0), True, C1), t.get_rect(center=(W//2-150, H//2+20)))
+#            screen.blit(t := FH.render("—",     True, (50,50,50)), t.get_rect(center=(W//2, H//2+20)))
+#            screen.blit(t := FH.render(str(s1), True, C2), t.get_rect(center=(W//2+150, H//2+20)))
+#            screen.blit(t := FS.render(f"First to {game.max_goals} goals", True, (60,60,60)),
+#                        t.get_rect(center=(W//2, H-30)))
+#
+#        pygame.display.flip()
+#        clock.tick(30)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("🏒 Floor Hockey — Matrix Edition")
-    config = run_config_ui()
-    if not config:
-        print("Cancelled."); return
+    config = {
+        "max_goals": 5,
+        "speed": "normal",
+        "paddle_len": 4,
+        "team1_name": "Team 1",
+        "team2_name": "Team 2"
+    }
+
+    #if not config:
+    #    print("Cancelled."); return
 
     net      = Network()
     game     = HockeyGame(net, config)
-    game_ref = [game]
+    #game_ref = [game]
 
-    threading.Thread(target=run_display, args=(game_ref, config), daemon=True).start()
+    #threading.Thread(target=run_display, args=(game_ref, config), daemon=True).start()
     print("Running! Ctrl+C to quit.")
+    t_start = time.time()
+    while time.time() - t_start < 3.0:
+        game.render()
+        time.sleep(0.05)
 
     dt = 1.0 / 20
     try:
@@ -641,15 +724,17 @@ def main():
             t0 = time.time()
             game.update(dt)
             game.render()
+
             if game.is_victory():
                 print(f"Game over! {game.score}")
                 time.sleep(2)
-                game = HockeyGame(net, config)
-                game_ref[0] = game
+                break
+                #game = HockeyGame(net, config)
+                #game_ref[0] = game
             time.sleep(max(0, dt - (time.time() - t0)))
     except KeyboardInterrupt:
         print("\nQuit.")
-        net.stop()
+        #net.stop()
 
 if __name__ == "__main__":
     main()

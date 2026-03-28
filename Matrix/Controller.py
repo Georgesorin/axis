@@ -29,8 +29,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix_ctr
 def _load_config():
     defaults = {
         "device_ip": "255.255.255.255",
-        "send_port": 4626,
-        "recv_port": 7800,
+        "send_port": 2001,
+        "recv_port": 2000,
         "auto_start_streaming": False,
         "last_used_ports": []
     }

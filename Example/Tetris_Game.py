@@ -1,10 +1,8 @@
 import socket
-import struct
 import time
 import threading
 import random
 import copy
-import psutil
 import os
 
 import json
@@ -15,7 +13,7 @@ try:
 except ImportError:
     PYGAME_AVAILABLE = False
 
-import SoundGenerator
+from Matrix import SoundGenerator
 
 # --- Configuration ---
 _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_config.json")
@@ -137,7 +135,7 @@ class SoundManager:
 
     def _load_sounds(self):
         # Ensure assets exist
-        if not os.path.exists("_sfx/bgm.wav"):
+        if not os.path.exists("../Matrix/_sfx/bgm.wav"):
             print("Generating SFX...")
             SoundGenerator.generate_all()
 
@@ -157,9 +155,9 @@ class SoundManager:
                     print(f"Failed to load {path}")
         
         # Load BGM
-        if os.path.exists("_sfx/bgm.wav"):
+        if os.path.exists("../Matrix/_sfx/bgm.wav"):
             try:
-                pygame.mixer.music.load("_sfx/bgm.wav")
+                pygame.mixer.music.load("../Matrix/_sfx/bgm.wav")
                 pygame.mixer.music.set_volume(0.5)
             except:
                 print("Failed to load BGM")
