@@ -15,8 +15,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix_sim
 
 def _load_config():
     defaults = {
-        "send_port": 2001,
-        "recv_port": 2000,
+        "send_port": 2000,
+        "recv_port": 2001,
         "device_ip": "255.255.255.255",
         "last_used_ports": []
     }
@@ -70,8 +70,8 @@ class MatrixSimulator:
         self.bind_ip = "0.0.0.0"
         
         # Ports
-        self.listen_port = CONFIG.get("recv_port", 2000)
-        self.send_port = CONFIG.get("send_port", 2001)
+        self.listen_port = CONFIG.get("recv_port", 2001)
+        self.send_port = CONFIG.get("send_port", 2000)
 
         # Button states for input
         self.pressed_leds = set()
