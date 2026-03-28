@@ -10,8 +10,8 @@ import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BOARD_W = 32
-BOARD_H = 16
+BOARD_W = 16
+BOARD_H = 32
 CELL = 24
 
 SEP_COL = 15
