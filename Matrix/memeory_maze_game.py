@@ -95,9 +95,9 @@ FINISH_SIZE = 4
 
 def _load_network_config(sim: bool) -> dict:
     fname = "matrix_sim_config.json" if sim else "matrix_ctrl_config.json"
-    defaults_sim  = {"device_ip": "255.255.255.255", "send_port": 2000,
-                     "recv_port": 2001, "bind_ip": "0.0.0.0"}
-    defaults_ctrl = {"device_ip": "10.5.0.2", "send_port": 4626,
+    defaults_sim  = {"device_ip": "255.255.255.255", "send_port": 2001,
+                     "recv_port": 2000, "bind_ip": "0.0.0.0"}
+    defaults_ctrl = {"device_ip": "255.255.255.255", "send_port": 4626,
                      "recv_port": 7800,  "bind_ip": "0.0.0.0"}
     defaults = defaults_sim if sim else defaults_ctrl
     try:
