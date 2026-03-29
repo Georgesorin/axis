@@ -27,44 +27,27 @@ UDP_SEND_PORT = 4626
 UDP_RECV_PORT = 7800
 
 # Culori
-#BLACK    = (0,   0,   0)
-BLACK = (0,0,0)
+BLACK    = (0,   0,   0)
 WHITE    = (255, 255, 255)
 RED      = (200, 0,   0)
-#YELLOW   = (255, 255, 0)
 #DARK_RED = (60,  0,   0)
 DARK_RED = (15,15,50)
 PURPLE   = (178, 102, 255)
 ORANGE   = (255, 130, 0)
-#GRAY     = (25,  25,  25)
 BORDER   = (15,  15,  50)
 
-# ─── Layout ───────────────────────────────────────────────────────────────────
-#  R0        : top border (blank)
-#  R1-R3     : arrow control zone E2
-#  R4        : goal E2   (cols 5-8)
-#  R5-R6     : empty
-#  R7        : paddle E2
-#  R8-R25    : play field
-#  R16       : center (puck start)
-#  R26       : paddle E1
-#  R27-R28   : empty
-#  R29       : goal E1   (cols 5-8)
-#  R30-R32   : arrow control zone E1
-#  R32       : bottom border (blank)
+# Design pentru zona de joc
+ARROW_ROWS_PLAYER_1 = [29, 30, 31]
+PADDLE_ROW_PLAYER_1 = 25
+GOAL_ROW_PLAYER_1   = 28
 
-ARROW_ROWS_E2 = [0, 1, 2]
-GOAL_ROW_E2   = 3
-PADDLE_ROW_E2 = 6
+ARROW_ROWS_PLAYER_2 = [0, 1, 2]
+PADDLE_ROW_PLAYER_2 = 6
+GOAL_ROW_PLAYER_2   = 3
 
-PADDLE_ROW_E1 = 25
-GOAL_ROW_E1   = 28
-ARROW_ROWS_E1 = [29, 30, 31]
-
-GOAL_COLS = [6, 7, 8, 9]
-
-PLAY_TOP    = PADDLE_ROW_E2 + 1
-PLAY_BOTTOM = PADDLE_ROW_E1 - 1
+GOAL_COLUMNS = [6, 7, 8, 9]
+PLAY_TOP    = PADDLE_ROW_PLAYER_2 + 1
+PLAY_BOTTOM = PADDLE_ROW_PLAYER_1 - 1
 CENTER_X    = BOARD_WIDTH // 2
 CENTER_Y    = (PLAY_TOP + PLAY_BOTTOM) // 2
 
@@ -259,15 +242,15 @@ class HockeyGame:
 
     def _dir_e1(self):
         # E1 bottom, faces UP: left zone = ← = -1, right zone = → = +1
-        l = self._pressed_left(ARROW_ROWS_E1)
-        r = self._pressed_right(ARROW_ROWS_E1)
+        l = self._pressed_left(ARROW_ROWS_PLAYER_1)
+        r = self._pressed_right(ARROW_ROWS_PLAYER_1)
         if l and not r: return -1
         if r and not l: return  1
         return 0
 
     def _dir_e2(self):
-        l = self._pressed_left(ARROW_ROWS_E2)
-        r = self._pressed_right(ARROW_ROWS_E2)
+        l = self._pressed_left(ARROW_ROWS_PLAYER_2)
+        r = self._pressed_right(ARROW_ROWS_PLAYER_2)
         if l and not r: return -1  # Acum săgeata stânga mută paleta la stânga
         if r and not l: return 1  # Acum săgeata dreapta mută paleta la dreapta
         return 0
@@ -306,13 +289,13 @@ class HockeyGame:
         paddle_e2_tiles = self._paddle_tiles(self.paddle_e2)
 
         if int(round(nx)) in paddle_e2_tiles:
-            if self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_E2 and ny <= PADDLE_ROW_E2 + 0.55:
-                ny = PADDLE_ROW_E2 + 0.55
+            if self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_PLAYER_2 and ny <= PADDLE_ROW_PLAYER_2 + 0.55:
+                ny = PADDLE_ROW_PLAYER_2 + 0.55
                 self.ball_dy = abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e2)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
-            elif self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_E2 and ny >= PADDLE_ROW_E2 - 0.55:
-                ny = PADDLE_ROW_E2 - 0.55
+            elif self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_PLAYER_2 and ny >= PADDLE_ROW_PLAYER_2 - 0.55:
+                ny = PADDLE_ROW_PLAYER_2 - 0.55
                 self.ball_dy = -abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e2)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
@@ -320,34 +303,34 @@ class HockeyGame:
         # Paddle E1 (ball going DOWN)
         paddle_e1_tiles = self._paddle_tiles(self.paddle_e1)
         if int(round(nx)) in paddle_e1_tiles:
-            if self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_E1 and ny >= PADDLE_ROW_E1 - 0.55:
-                ny = PADDLE_ROW_E1 - 0.55
+            if self.ball_dy > 0 and self.ball_y <= PADDLE_ROW_PLAYER_1 and ny >= PADDLE_ROW_PLAYER_1 - 0.55:
+                ny = PADDLE_ROW_PLAYER_1 - 0.55
                 self.ball_dy = -abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e1)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
-            elif self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_E1 and ny <= PADDLE_ROW_E1 + 0.55:
-                ny = PADDLE_ROW_E1 + 0.55
+            elif self.ball_dy < 0 and self.ball_y >= PADDLE_ROW_PLAYER_1 and ny <= PADDLE_ROW_PLAYER_1 + 0.55:
+                ny = PADDLE_ROW_PLAYER_1 + 0.55
                 self.ball_dy = abs(self.ball_dy)
                 self._deflect(nx, self.paddle_e1)
                 self.ball_speed = min(self.ball_speed * 1.05, self.base_speed * 2.0)
 
         # Goal E2 (ball going UP past goal row)
-        if ny <= GOAL_ROW_E2 + 0.55:
-            if int(round(nx)) in GOAL_COLS:
-                if ny <= GOAL_ROW_E2:  # Intră complet în poartă
+        if ny <= GOAL_ROW_PLAYER_2 + 0.55:
+            if int(round(nx)) in GOAL_COLUMNS:
+                if ny <= GOAL_ROW_PLAYER_2:  # Intră complet în poartă
                     self._score(scorer=0); return
             else:
-                ny = float(GOAL_ROW_E2) + 0.55
+                ny = float(GOAL_ROW_PLAYER_2) + 0.55
                 self.ball_dy = abs(self.ball_dy)
 
         # Goal E1 (ball going DOWN past goal row)
-        if ny >= GOAL_ROW_E1 - 0.55:
-            if int(round(nx)) in GOAL_COLS:
-                if ny >= GOAL_ROW_E1:  # Intră complet în poartă
+        if ny >= GOAL_ROW_PLAYER_1 - 0.55:
+            if int(round(nx)) in GOAL_COLUMNS:
+                if ny >= GOAL_ROW_PLAYER_1:  # Intră complet în poartă
                     self._score(scorer=1);
                     return
             else:
-                ny = float(GOAL_ROW_E1) - 0.55
+                ny = float(GOAL_ROW_PLAYER_1) - 0.55
                 self.ball_dy = -abs(self.ball_dy)
 
         self.ball_x, self.ball_y = nx, ny
@@ -429,17 +412,17 @@ class HockeyGame:
         draw_char(g, str(self.score[0]), 5, 17, dim_purple)
 
         for x in range(BOARD_WIDTH):
-            g[(x, GOAL_ROW_E2)] = RED   if x in GOAL_COLS else DARK_RED
-            g[(x, GOAL_ROW_E1)] = RED   if x in GOAL_COLS else DARK_RED
+            g[(x, GOAL_ROW_PLAYER_2)] = RED   if x in GOAL_COLUMNS else DARK_RED
+            g[(x, GOAL_ROW_PLAYER_1)] = RED   if x in GOAL_COLUMNS else DARK_RED
 
         # Arrows E2 (rows 1-3)
         # Left zone (cols 1-4) = arrow RIGHT (s_dr) → moving paddle right
         # Right zone (cols 11-14) = arrow LEFT (s_st) → moving paddle left
-        lp2 = self._pressed_left(ARROW_ROWS_E2)
-        rp2 = self._pressed_right(ARROW_ROWS_E2)
+        lp2 = self._pressed_left(ARROW_ROWS_PLAYER_2)
+        rp2 = self._pressed_right(ARROW_ROWS_PLAYER_2)
         cl2 = WHITE if lp2 else ORANGE
         cr2 = WHITE if rp2 else ORANGE
-        for ri, row in enumerate(ARROW_ROWS_E2):
+        for ri, row in enumerate(ARROW_ROWS_PLAYER_2):
             for ci in range(4):
                 # Am inversat ARROW_R cu ARROW_L
                 g[(ARROW_LEFT_START + ci, row)] = cl2 if ARROW_L[ri][ci] else BLACK
@@ -448,20 +431,20 @@ class HockeyGame:
         # Arrows E1 (rows 30-32)
         # Left zone (cols 1-4) = arrow LEFT (s_st) → moving paddle left
         # Right zone (cols 11-14) = arrow RIGHT (s_dr) → moving paddle right
-        lp1 = self._pressed_left(ARROW_ROWS_E1)
-        rp1 = self._pressed_right(ARROW_ROWS_E1)
+        lp1 = self._pressed_left(ARROW_ROWS_PLAYER_1)
+        rp1 = self._pressed_right(ARROW_ROWS_PLAYER_1)
         cl1 = WHITE if lp1 else PURPLE
         cr1 = WHITE if rp1 else PURPLE
-        for ri, row in enumerate(ARROW_ROWS_E1):
+        for ri, row in enumerate(ARROW_ROWS_PLAYER_1):
             for ci in range(4):
                 g[(ARROW_LEFT_START  + ci, row)] = cl1 if ARROW_L[ri][ci] else BLACK
                 g[(ARROW_RIGHT_START + ci, row)] = cr1 if ARROW_R[ri][ci] else BLACK
 
         # Paddles
         for x in self._paddle_tiles(self.paddle_e2):
-            g[(x, PADDLE_ROW_E2)] = ORANGE
+            g[(x, PADDLE_ROW_PLAYER_2)] = ORANGE
         for x in self._paddle_tiles(self.paddle_e1):
-            g[(x, PADDLE_ROW_E1)] = PURPLE
+            g[(x, PADDLE_ROW_PLAYER_1)] = PURPLE
 
         # Center dot
         #g[(CENTER_X, CENTER_Y)] = GRAY
