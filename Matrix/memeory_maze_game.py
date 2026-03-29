@@ -1,11 +1,11 @@
 """
-memeory_maze_game.py
-====================
+memory_maze_game.py
+===================
 Memory Maze — standalone game for a 16 × 32 LED touch floor.
 
-Run directly:  python memeory_maze_game.py
-  Opens a tkinter SimWindow (16×32 grid).
-  Click / drag to simulate floor touches.  F11 = fullscreen.
+Run directly:  python memory_maze_game.py [--sim]
+  --sim  : use matrix_sim_config.json (ports 2000/2001, broadcast)
+  (no flag) : use matrix_ctrl_config.json (ports 4626/7800, device IP)
 
 Architecture
 ------------
@@ -13,54 +13,14 @@ Architecture
   MemoryMazeGame — all game logic + rendering into self.grid dict
   SimWindow      — tkinter preview; reads self.grid, relays mouse as touches
   main()         — wires all three, runs via root.mainloop()
-
-Board orientation
------------------
-  The START is a 3-col × 4-row block centred on the LEFT long side (x=0..2).
-  All display text is FLIPPED (rotated 180°) so it reads from the start side.
-  The FINISH is always a fixed 4×4 square on the right side; its vertical
-  position shifts every reset.
-
-Lobby layout
-------------
-  Start block   : x=0..2, rows centred vertically (always 3 cols × 4 rows)
-  Minus button  : 3 rows × 1 col, directly BELOW start, oriented vertically
-  Plus button   : 3×3 square with cut corners, directly ABOVE start
-  Start button  : 4 rows × 1 col, 1 col to the right of the start block
-  Player count  : flipped 3×5 text, centred, facing the start side
-
-Game phases
------------
-  LOBBY      Choose players (2-6), confirm via Start button.
-  SHOW_MAZE  BFS wave reveals paths (5 s).
-  PLAYING    Galaxy floor, hidden maze, special tiles, audio timer.
-  FAIL       Red flash, return all to start.
-  RESET      All return to start mid-game → "RESET GAME" screen with wave.
-  WIN        All at finish → "WIN  xP" flipped.
-  LOSE       Timer expired → "LOST" flipped.
-
-Special tiles
--------------
-  Purple (×3) — step: 3 random path tiles pulse cyan for 3 s; tile shows
-                path colour after you leave.
-  Yellow (×2) — step: BFS path fades for 4 s, tile becomes wall; tile shows
-                wall colour (black) after you leave.
-
-Timer
------
-  No on-board timer display.  Audio cues via maze_sounds.AudioTimer:
-    half-time beep, 30-second beep, countdown ticks 10→1.
-
-Win/Lose/Reset checks
----------------------
-  WIN   : all players are on finish tiles (none on field).
-  RESET : all players are on start tiles (none on field) during PLAYING/FAIL.
-  Maze reveal peek : all players are on start OR finish (none on field).
 """
 
+import json
 import math
+import os
 import random
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -81,13 +41,9 @@ from maze_sounds import AudioTimer, save_wav, generate_tone, play_sound, SFX_DIR
 # =============================================================================
 BOARD_W = 16
 BOARD_H = 32
-NUM_CHANNELS = 8
+NUM_CHANNELS     = 8
 LEDS_PER_CHANNEL = 64
-FRAME_DATA_LEN = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
-
-UDP_TARGET_IP = "255.255.255.255"
-SEND_PORT = 2000
-RECV_PORT = 2001
+FRAME_DATA_LEN   = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
 
 BLACK        = (  0,   0,   0)
 WHITE        = (255, 255, 255)
@@ -98,29 +54,25 @@ YELLOW_COL   = (220, 200,   0)
 GREEN_START  = (  0, 180,   0)
 GREEN_FINISH = ( 20, 255,  80)
 RED_FAIL     = (220,   0,   0)
-BTN_MINUS_COL = (160,  20, 220)   # minus button colour
-BTN_PLUS_COL  = (  0, 180, 220)   # plus  button colour
-BTN_START_COL = (255, 140,   0)   # start button colour
+BTN_MINUS_COL = (160,  20, 220)
+BTN_PLUS_COL  = (  0, 180, 220)
+BTN_START_COL = (255, 140,   0)
 
 PHASE_LOBBY     = "lobby"
 PHASE_SHOW_MAZE = "show_maze"
 PHASE_PLAYING   = "playing"
 PHASE_FAIL      = "fail"
-PHASE_RESET     = "reset"
 PHASE_WIN       = "win"
 PHASE_LOSE      = "lose"
 
-MAZE_SHOW_DUR     = 5.0
-MAZE_RETURN_DUR   = 3.0
-FIELD_CLEAR_GRACE = 0.5
-PURPLE_DUR        = 3.0
-YELLOW_DUR        = 4.0
+MAZE_SHOW_DUR     = 15.0  # Increased to 20 seconds
+PURPLE_DUR        = 5.0   
+YELLOW_DUR        = 5.0   
 FAIL_FLASH_DUR    = 1.5
-RESET_DUR         = 4.0
-WIN_DUR           = 7.0
-LOSE_DUR          = 6.0
+WIN_DUR           = 10.0
+LOSE_DUR          = 10.0
 LOBBY_CONFIRM_DUR = 0.8
-SCORE_PER_SEC  = 10
+SCORE_PER_SEC  = 1
 FAIL_PENALTY   = 20
 NUM_PURPLE     = 3
 NUM_YELLOW     = 2
@@ -131,24 +83,52 @@ MAX_PLAYERS    = 6
 START_COLS = 3
 START_ROWS = 4
 START_X    = 0
-START_Y    = (BOARD_H - START_ROWS) // 2   # top row of start block = 14
+START_Y    = (BOARD_H - START_ROWS) // 2   # = 14
 
 # Finish region: 4×4 square, position shifts each reset
 FINISH_SIZE = 4
 
 
 # =============================================================================
-# Sound file generation (called once at startup)
+# Config loader
+# =============================================================================
+
+def _load_network_config(sim: bool) -> dict:
+    fname = "matrix_sim_config.json" if sim else "matrix_ctrl_config.json"
+    defaults_sim  = {"device_ip": "255.255.255.255", "send_port": 2000,
+                     "recv_port": 2001, "bind_ip": "0.0.0.0"}
+    defaults_ctrl = {"device_ip": "10.5.0.2", "send_port": 4626,
+                     "recv_port": 7800,  "bind_ip": "0.0.0.0"}
+    defaults = defaults_sim if sim else defaults_ctrl
+    try:
+        with open(fname) as f:
+            cfg = json.load(f)
+        for k, v in defaults.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except Exception:
+        return defaults
+
+
+# =============================================================================
+# Sound generation
 # =============================================================================
 
 def _ensure_sounds():
-    """Generate all needed WAV files into SFX_DIR if they don't exist."""
-    import os
     files = {
-        "half.wav":   (880,  0.25, 0.6, "sine",   0),
-        "warn30.wav": (660,  0.35, 0.7, "square", 0),
-        "tick.wav":   (1100, 0.12, 0.5, "sine",   0),
-        "player.wav": (1200, 0.10, 0.4, "sine",   0),   # lobby player-change beep
+        # Timer cues
+        "half.wav":    (659,  0.35, 0.6, "sine",   300),    
+        "warn30.wav":  (784,  0.35, 0.7, "sine",  -200),    
+        "tick.wav":    (1100, 0.12, 0.5, "sine",   0),
+        # Lobby buttons
+        "btn_plus.wav":  (1320, 0.09, 0.5, "sine",   200),  
+        "btn_minus.wav": (880,  0.09, 0.5, "sine",  -200),   
+        "btn_go.wav":    (660,  0.20, 0.7, "square", 400),   
+        # Game events
+        "fail.wav":    (180,  0.45, 0.8, "square", -60),    
+        "win.wav":     (1047, 0.50, 0.7, "sine",   300),    
+        "lose.wav":    (220,  0.60, 0.7, "saw",   -80),     
+        "reset.wav":   (440,  0.30, 0.6, "square",  0),    
     }
     for fname, (freq, dur, vol, wtype, slide) in files.items():
         path = os.path.join(SFX_DIR, fname)
@@ -182,38 +162,40 @@ def _fade_io(elapsed, dur):
     return math.sin(math.pi * elapsed / dur)
 
 def _game_duration(players):
-    """≤3 players → 2 min (120 s); >3 players → 3 min (180 s)."""
     return 120 if players <= 3 else 180
 
 
 # =============================================================================
-# Text rendering helpers (flipped 180° to face start side)
+# Text rendering 
 # =============================================================================
 
-def _text3x5_flipped(g, text, x, y, col):
-    """
-    Render text in FONT_3x5 rotated 180° so it reads from the start (left) side.
-    In 180° rotation: a pixel at (vx, vy) maps to (BOARD_W-1-vx, BOARD_H-1-vy).
-    """
-    cx = x
+_GLYPH_H = 5
+
+def _text3x5_rot90(g, text: str, x0: int, y0: int, col: tuple) -> None:
+    cy = y0
     for ch in text:
         glyph = FONT_3x5.get(ch, FONT_3x5.get("?", [0, 0, 0]))
+        glyph_w = len(glyph)
         for ci, mask in enumerate(glyph):
-            for ri in range(5):
+            for ri in range(_GLYPH_H):
                 if (mask >> ri) & 1:
-                    px = BOARD_W - 1 - (cx + ci)
-                    py = BOARD_H - 1 - (y + ri)
+                    px = x0 + (_GLYPH_H - 1 - ri)
+                    py = cy + ci
                     if 0 <= px < BOARD_W and 0 <= py < BOARD_H:
                         g[(px, py)] = col
-        cx += len(glyph) + 1
+        cy += glyph_w + 1
 
-
-def _text_width_3x5(text):
+def _text_height_3x5(text: str) -> int:
     total = 0
     for ch in text:
         glyph = FONT_3x5.get(ch, FONT_3x5.get("?", [0, 0, 0]))
         total += len(glyph) + 1
     return max(0, total - 1)
+
+def _draw_centered_rot90(g, text: str, x0: int, col: tuple) -> None:
+    th = _text_height_3x5(text)
+    y0 = max(0, (BOARD_H - th) // 2)
+    _text3x5_rot90(g, text, x0, y0, col)
 
 
 # =============================================================================
@@ -221,15 +203,16 @@ def _text_width_3x5(text):
 # =============================================================================
 
 class Network:
-    """UDP send/receive for the LED hardware / Simulator."""
-
-    def __init__(self, target_ip=UDP_TARGET_IP, send_port=SEND_PORT, recv_port=RECV_PORT):
-        self.target_ip = target_ip
-        self.send_port = send_port
-        self.recv_port = recv_port
-        self.seq = 0
-        self._lock = threading.Lock()
-        self.triggers = {}
+    def __init__(self, sim: bool = False):
+        cfg = _load_network_config(sim)
+        self.target_ip = cfg["device_ip"]
+        self.send_port = cfg["send_port"]
+        self.recv_port = cfg["recv_port"]
+        self.bind_ip   = cfg.get("bind_ip", "0.0.0.0")
+        self.sim       = sim
+        self.seq       = 0
+        self._lock     = threading.Lock()
+        self.triggers: Dict[Tuple[int, int], bool] = {}
 
         self.sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -238,8 +221,8 @@ class Network:
         self.sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock_recv.settimeout(0.3)
         try:
-            self.sock_recv.bind(("0.0.0.0", self.recv_port))
-            print(f"Network: recv on :{self.recv_port}  send->{target_ip}:{send_port}")
+            self.sock_recv.bind((self.bind_ip, self.recv_port))
+            print(f"Network ({'sim' if sim else 'ctrl'}): recv :{self.recv_port}  send→{self.target_ip}:{self.send_port}")
         except Exception as e:
             print(f"Network: recv bind failed: {e}")
 
@@ -255,71 +238,68 @@ class Network:
                         for ch in range(NUM_CHANNELS):
                             base = 2 + ch * 171
                             for led in range(LEDS_PER_CHANNEL):
-                                self.triggers[(ch, led)] = (data[base+1+led] == 0xCC)
+                                self.triggers[(ch, led)] = (data[base + 1 + led] == 0xCC)
             except socket.timeout:
                 pass
             except Exception:
                 pass
 
-    def is_pressed(self, x, y):
+    def is_pressed(self, x: int, y: int) -> bool:
         if not (0 <= x < BOARD_W and 0 <= y < BOARD_H):
             return False
-        ch = min(y // 4, NUM_CHANNELS - 1)
-        row_in_ch = y % 4
-        led = (row_in_ch*16 + x) if row_in_ch % 2 == 0 else (row_in_ch*16 + (15-x))
+        ch  = min(y // 4, NUM_CHANNELS - 1)
+        row = y % 4
+        led = row * 16 + x if row % 2 == 0 else row * 16 + (15 - x)
         with self._lock:
             return self.triggers.get((ch, led), False)
 
-    def send_frame(self, grid):
+    def send_frame(self, grid: dict):
         buf = bytearray(FRAME_DATA_LEN)
         for (x, y), color in grid.items():
             if not (0 <= x < BOARD_W and 0 <= y < BOARD_H):
                 continue
-            ch = min(y // 4, NUM_CHANNELS - 1)
-            row_in_ch = y % 4
-            led = (row_in_ch*16 + x) if row_in_ch % 2 == 0 else (row_in_ch*16 + (15-x))
-            block = NUM_CHANNELS * 3
+            ch     = min(y // 4, NUM_CHANNELS - 1)
+            row    = y % 4
+            led    = row * 16 + x if row % 2 == 0 else row * 16 + (15 - x)
+            block  = NUM_CHANNELS * 3
             offset = led * block + ch
-            if offset + NUM_CHANNELS*2 < len(buf):
-                buf[offset]                  = color[1]
-                buf[offset + NUM_CHANNELS]   = color[0]
-                buf[offset + NUM_CHANNELS*2] = color[2]
+            if offset + NUM_CHANNELS * 2 < len(buf):
+                buf[offset]                  = color[1]   
+                buf[offset + NUM_CHANNELS]   = color[0]   
+                buf[offset + NUM_CHANNELS*2] = color[2]   
         self._send_packet(buf)
 
-    def _send_packet(self, frame_data):
+    def _send_packet(self, frame_data: bytes):
         self.seq = (self.seq % 0xFFFF) + 1
         ip, port = self.target_ip, self.send_port
 
         def tx(pkt):
             try:
                 self.sock_send.sendto(pkt, (ip, port))
-                self.sock_send.sendto(pkt, ("127.0.0.1", port))
             except Exception:
                 pass
 
         def make(inner, cs=0x1E):
-            r1, r2 = random.randint(0,127), random.randint(0,127)
+            r1, r2 = random.randint(0, 127), random.randint(0, 127)
             ln = len(inner) - 1
-            p = bytearray([0x75, r1, r2, (ln>>8)&0xFF, ln&0xFF]) + inner
+            p  = bytearray([0x75, r1, r2, (ln >> 8) & 0xFF, ln & 0xFF])
+            p += bytearray(inner)
             p += bytearray([cs, 0x00])
             return p
 
-        tx(bytearray([0x75,0,0,0,8,0x02,0,0,0x33,0x44,
-                      (self.seq>>8)&0xFF, self.seq&0xFF, 0,0,0,0x0E,0]))
+        tx(bytearray([0x75, 0, 0, 0, 8, 0x02, 0, 0, 0x33, 0x44, (self.seq >> 8) & 0xFF, self.seq & 0xFF, 0, 0, 0, 0x0E, 0]))
         pay = bytearray()
         for _ in range(NUM_CHANNELS):
-            pay += bytes([(LEDS_PER_CHANNEL>>8)&0xFF, LEDS_PER_CHANNEL&0xFF])
-        tx(make(bytearray([0x02,0,0,0x88,0x77,0xFF,0xF0,
-                           (len(pay)>>8)&0xFF, len(pay)&0xFF]) + pay))
+            pay += bytes([(LEDS_PER_CHANNEL >> 8) & 0xFF, LEDS_PER_CHANNEL & 0xFF])
+        tx(make(bytearray([0x02, 0, 0, 0x88, 0x77, 0xFF, 0xF0, (len(pay) >> 8) & 0xFF, len(pay) & 0xFF]) + pay))
+        
         for i, idx in enumerate(range(0, len(frame_data), 984), 1):
-            chunk = frame_data[idx:idx+984]
-            inner = bytearray([0x02,0,0,0x88,0x77,
-                                (i>>8)&0xFF, i&0xFF,
-                                (len(chunk)>>8)&0xFF, len(chunk)&0xFF]) + bytearray(chunk)
-            tx(make(inner, 0x1E if len(chunk)==984 else 0x36))
+            chunk = frame_data[idx:idx + 984]
+            inner = bytearray([0x02, 0, 0, 0x88, 0x77, (i >> 8) & 0xFF, i & 0xFF, (len(chunk) >> 8) & 0xFF, len(chunk) & 0xFF]) + bytearray(chunk)
+            tx(make(inner, 0x1E if len(chunk) == 984 else 0x36))
             time.sleep(0.001)
-        tx(bytearray([0x75,0,0,0,8,0x02,0,0,0x55,0x66,
-                      (self.seq>>8)&0xFF, self.seq&0xFF, 0,0,0,0x0E,0]))
+            
+        tx(bytearray([0x75, 0, 0, 0, 8, 0x02, 0, 0, 0x55, 0x66, (self.seq >> 8) & 0xFF, self.seq & 0xFF, 0, 0, 0, 0x0E, 0]))
 
     def stop(self):
         self._running = False
@@ -334,22 +314,8 @@ class Network:
 # =============================================================================
 
 class MemoryMazeGame:
-    """
-    Full Memory Maze game logic + rendering.
-
-    Start region  : x=0..2 (3 cols), y=START_Y..START_Y+3 (4 rows), always.
-    Finish region : 4×4 square; right edge at x=BOARD_W-1; y varies each reset.
-
-    Lobby buttons (all relative to start block, facing start side)
-    ──────────────────────────────────────────────────────────────
-    Minus  : 1 col × 3 rows, directly below start, col=1 (centred)
-    Plus   : 3×3 square with cut corners, directly above start, centred
-    Start  : 4 rows × 1 col, 1 col to the right of start (col=START_COLS)
-    Count  : flipped text, centred beside plus button
-    """
-
-    def __init__(self, net):
-        self.net = net
+    def __init__(self, net: Network):
+        self.net  = net
         self.grid = {(x, y): BLACK for y in range(BOARD_H) for x in range(BOARD_W)}
 
         self.phase        = PHASE_LOBBY
@@ -359,31 +325,31 @@ class MemoryMazeGame:
         self.total_time   = 0.0
         self.remaining    = 0.0
 
-        self.maze           = []
-        self.start_tiles    = self._static_start_tiles()
-        self.finish_tiles   = set()
-        self.purple_tiles   = set()
-        self.yellow_tiles   = set()
-        self.purple_reveals = []   # list of {tiles, start, duration}
-        self.yellow_paths   = []   # list of {tiles, start, duration}
+        self.maze             = []
+        self.start_tiles      = self._static_start_tiles()
+        self.finish_tiles: Set[Coord] = set()
+        self.purple_tiles: Set[Coord] = set()
+        self.yellow_tiles: Set[Coord] = set()
+        self.purple_reveals: List[dict] = []
+        self.yellow_paths:   List[dict] = []
 
-        self._curr_pressed   = set()
-        self._phase_time     = 0.0
-        self._timer          = 0.0
-        self._maze_visible   = False
-        self._reveal_order   = []
-        self._reveal_count   = 0.0
+        self._curr_pressed: Set[Coord] = set()
+        self._phase_time   = 0.0
+        self._timer        = 0.0
+        self._maze_visible = False
+        self._reveal_order: List[Coord] = []
+        self._reveal_count = 0.0
 
         self._lobby_players  = MIN_PLAYERS
         self._lobby_confirm  = 0.0
 
-        self._field_clear_tmr = 0.0
-        self._confetti        = []
-        self._just_returned   = False
+        self._return_presses = 0
+
+        self._confetti: List[dict] = []
+        self._just_returned = False
 
         self._audio_timer: Optional[AudioTimer] = None
 
-        # Lobby button geometry (derived from start block)
         self._minus_tiles = self._compute_minus_tiles()
         self._plus_tiles  = self._compute_plus_tiles()
         self._go_tiles    = self._compute_go_tiles()
@@ -396,33 +362,24 @@ class MemoryMazeGame:
 
     @staticmethod
     def _static_start_tiles() -> Set[Coord]:
-        """Start is always 3 cols × 4 rows centred on the left long side."""
         return {(x, y) for x in range(START_COLS)
                 for y in range(START_Y, START_Y + START_ROWS)}
 
     def _compute_minus_tiles(self) -> Set[Coord]:
-        """3 rows × 1 col directly BELOW start block, centred (col 1)."""
-        cx = START_X + START_COLS // 2          # col 1
-        top = START_Y + START_ROWS               # first row below start
+        cx  = START_X + START_COLS // 2
+        top = START_Y + START_ROWS
         return {(cx, top + r) for r in range(3)}
 
     def _compute_plus_tiles(self) -> Set[Coord]:
-        """
-        3×3 square with cut corners (plus-like shape) directly ABOVE start,
-        centred horizontally.  Cut corners = only the cross remains.
-        """
-        cx = START_X + START_COLS // 2          # col 1
-        bot = START_Y - 1                        # row just above start
-        top = bot - 2                            # 3 rows tall: top..bot
-        mid = top + 1
-        # Full 3×3 minus four corners → cross shape
-        full = {(cx-1+dx, top+dy) for dx in range(3) for dy in range(3)}
-        corners = {(cx-1, top), (cx+1, top), (cx-1, bot), (cx+1, bot)}
+        cx  = START_X + START_COLS // 2
+        bot = START_Y - 1
+        top = bot - 2
+        full    = {(cx - 1 + dx, top + dy) for dx in range(3) for dy in range(3)}
+        corners = {(cx - 1, top), (cx + 1, top), (cx - 1, bot), (cx + 1, bot)}
         return full - corners
 
     def _compute_go_tiles(self) -> Set[Coord]:
-        """4 rows × 1 col, 1 col to the right of the start block."""
-        gx = START_X + START_COLS               # col 3
+        gx = START_X + START_COLS
         return {(gx, START_Y + r) for r in range(START_ROWS)}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -437,24 +394,25 @@ class MemoryMazeGame:
             PHASE_SHOW_MAZE: "Memorise the maze — disappears on the field",
             PHASE_PLAYING:   "Navigate the hidden maze to the finish",
             PHASE_FAIL:      "Wrong tile! All players return to start",
-            PHASE_RESET:     "All returned — resetting round",
             PHASE_WIN:       "All players reached the finish!",
             PHASE_LOSE:      "Timer ran out!",
         }
         return {
-            "phase":            self.phase,
-            "phase_label":      labels.get(self.phase, self.phase),
-            "player_count":     self.player_count,
-            "lobby_selection":  self._lobby_players,
-            "team_score":       self.team_score,
-            "finishers":        self.finishers,
-            "remaining_sec":    round(self.remaining, 1),
-            "remaining_fmt":    f"{secs//60}:{secs%60:02d}",
-            "maze_visible":     self._maze_visible,
-            "maze_ready":       bool(self.maze),
-            "reveal_progress":  round(self._reveal_count/total, 3) if total else 0.0,
-            "purple_tiles":     len(self.purple_tiles),
-            "yellow_tiles":     len(self.yellow_tiles),
+            "phase":           self.phase,
+            "phase_label":     labels.get(self.phase, self.phase),
+            "player_count":    self.player_count,
+            "lobby_selection": self._lobby_players,
+            "team_score":      self.team_score,
+            "finishers":       self.finishers,
+            "remaining_sec":   round(self.remaining, 1),
+            "remaining_fmt":   f"{secs//60}:{secs%60:02d}",
+            "maze_visible":    self._maze_visible,
+            "maze_ready":      bool(self.maze),
+            "reveal_progress": round(self._reveal_count / total, 3) if total else 0.0,
+            "purple_tiles":    len(self.purple_tiles),
+            "yellow_tiles":    len(self.yellow_tiles),
+            "return_presses":    self._return_presses,
+            "players_to_return": max(0, self.player_count - self._return_presses),
         }
 
     def print_state(self):
@@ -487,31 +445,31 @@ class MemoryMazeGame:
         print("\n".join(lines))
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Touch shims (for SimWindow / Controller)
+    # Touch shims 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def on_touch(self, index):
+    def on_touch(self, index: int):
         x, y = index % BOARD_W, index // BOARD_W
         if 0 <= x < BOARD_W and 0 <= y < BOARD_H:
             self._curr_pressed.add((x, y))
             self._handle_press(x, y)
 
-    def on_release(self, index):
+    def on_release(self, index: int):
         x, y = index % BOARD_W, index // BOARD_W
         self._curr_pressed.discard((x, y))
 
-    def on_touch_press(self, x, y):
+    def on_touch_press(self, x: int, y: int):
         self._curr_pressed.add((x, y))
         self._handle_press(x, y)
 
-    def on_touch_release(self, x, y):
+    def on_touch_release(self, x: int, y: int):
         self._curr_pressed.discard((x, y))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main loop
     # ─────────────────────────────────────────────────────────────────────────
 
-    def update(self, dt):
+    def update(self, dt: float):
         self._just_returned = False
         self._phase_time   += dt
         self._poll_touches()
@@ -520,7 +478,6 @@ class MemoryMazeGame:
         elif self.phase == PHASE_SHOW_MAZE: self._upd_show_maze(dt)
         elif self.phase == PHASE_PLAYING:   self._upd_playing(dt)
         elif self.phase == PHASE_FAIL:      self._upd_fail(dt)
-        elif self.phase == PHASE_RESET:     self._upd_reset(dt)
         elif self.phase in (PHASE_WIN, PHASE_LOSE): self._upd_end(dt)
 
     def render(self):
@@ -529,20 +486,19 @@ class MemoryMazeGame:
         elif self.phase == PHASE_SHOW_MAZE: self._draw_show_maze(g)
         elif self.phase == PHASE_PLAYING:   self._draw_playing(g)
         elif self.phase == PHASE_FAIL:      self._draw_fail(g)
-        elif self.phase == PHASE_RESET:     self._draw_reset(g)
         elif self.phase == PHASE_WIN:       self._draw_win(g)
         elif self.phase == PHASE_LOSE:      self._draw_lose(g)
         self.net.send_frame(g)
 
-    def is_game_over(self):
+    def is_game_over(self) -> bool:
         return self._just_returned
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Touch polling (edge detection)
+    # Touch polling 
     # ─────────────────────────────────────────────────────────────────────────
 
     def _poll_touches(self):
-        new = set()
+        new: Set[Coord] = set()
         for y in range(BOARD_H):
             for x in range(BOARD_W):
                 try:
@@ -554,7 +510,7 @@ class MemoryMazeGame:
             self._handle_press(*tile)
         self._curr_pressed = new
 
-    def _handle_press(self, x, y):
+    def _handle_press(self, x: int, y: int):
         if   self.phase == PHASE_LOBBY:     self._lobby_press(x, y)
         elif self.phase == PHASE_SHOW_MAZE: self._show_maze_press(x, y)
         elif self.phase == PHASE_PLAYING:   self._playing_press(x, y)
@@ -564,11 +520,11 @@ class MemoryMazeGame:
     # Phase updaters
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _upd_lobby(self, dt):
+    def _upd_lobby(self, dt: float):
         if self._lobby_confirm > 0:
             self._lobby_confirm -= dt
 
-    def _upd_show_maze(self, dt):
+    def _upd_show_maze(self, dt: float):
         total = len(self._reveal_order)
         if total > 0:
             self._reveal_count = min(float(total),
@@ -577,70 +533,30 @@ class MemoryMazeGame:
         if self._timer <= 0:
             self._maze_visible = False
             self.phase = PHASE_PLAYING
+            # Start timer precisely when phase switches to Playing to prevent 10s loss
+            self._audio_timer = AudioTimer(self.remaining) 
             print("Maze hidden — PLAYING.")
 
-    def _upd_playing(self, dt):
+    def _upd_playing(self, dt: float):
         self.remaining -= dt
         if self.remaining <= 0:
             self.remaining = 0.0
             self._enter_lose()
             return
 
-        # Audio timer
         if self._audio_timer:
             self._audio_timer.update()
 
         now = time.time()
         self.purple_reveals = [r for r in self.purple_reveals
-                                if now - r["start"] < r["duration"]]
+                               if now - r["start"] < r["duration"]]
         self.yellow_paths   = [p for p in self.yellow_paths
-                                if now - p["start"] < p["duration"]]
+                               if now - p["start"] < p["duration"]]
 
-        # --- Maze peek: all pressed tiles are on start OR finish (not field) ---
-        if self._curr_pressed:
-            all_safe = all(pos in self.start_tiles or pos in self.finish_tiles
-                           for pos in self._curr_pressed)
-            any_on_field = not all_safe
-        else:
-            all_safe = False
-            any_on_field = False
-
-        if all_safe:
-            self._field_clear_tmr += dt
-            if self._field_clear_tmr >= FIELD_CLEAR_GRACE and not self._maze_visible:
-                self._maze_visible = True
-                self._timer = MAZE_RETURN_DUR
-        else:
-            self._field_clear_tmr = 0.0
-            if any_on_field:
-                self._maze_visible = False
-
-        if self._maze_visible:
-            self._timer -= dt
-            if self._timer <= 0:
-                self._maze_visible = False
-
-        # --- RESET check: all pressed tiles are on START (none elsewhere) ---
-        if self._curr_pressed:
-            all_on_start = all(pos in self.start_tiles for pos in self._curr_pressed)
-            if all_on_start and len(self._curr_pressed) >= self.player_count:
-                self._enter_reset()
-
-    def _upd_fail(self, dt):
+    def _upd_fail(self, dt: float):
         self._timer -= dt
-        # Check reset: all players back on start
-        if self._curr_pressed:
-            all_on_start = all(pos in self.start_tiles for pos in self._curr_pressed)
-            if all_on_start and len(self._curr_pressed) >= self.player_count:
-                self._enter_reset()
 
-    def _upd_reset(self, dt):
-        self._timer -= dt
-        if self._timer <= 0:
-            print("Round reset — new maze.")
-            self._new_round()
-
-    def _upd_end(self, dt):
+    def _upd_end(self, dt: float):
         self._timer -= dt
         self._upd_confetti(dt)
         if self._timer <= 0:
@@ -653,73 +569,97 @@ class MemoryMazeGame:
     # Press handlers
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _lobby_press(self, x, y):
+    def _lobby_press(self, x: int, y: int):
         pos = (x, y)
         if pos in self._minus_tiles:
             old = self._lobby_players
             self._lobby_players = max(MIN_PLAYERS, self._lobby_players - 1)
             self._lobby_confirm = LOBBY_CONFIRM_DUR
-            play_sound("player.wav")
+            play_sound("btn_minus.wav")
             print(f"Lobby: {old} → {self._lobby_players} players (−)")
             return
         if pos in self._plus_tiles:
             old = self._lobby_players
             self._lobby_players = min(MAX_PLAYERS, self._lobby_players + 1)
             self._lobby_confirm = LOBBY_CONFIRM_DUR
-            play_sound("player.wav")
+            play_sound("btn_plus.wav")
             print(f"Lobby: {old} → {self._lobby_players} players (+)")
             return
         if pos in self._go_tiles:
+            play_sound("btn_go.wav")
             print(f"Lobby: GO pressed — {self._lobby_players} players.")
             self._start_game(self._lobby_players)
 
-    def _show_maze_press(self, x, y):
-        # Stepping off start/finish hides the maze immediately
+    def _show_maze_press(self, x: int, y: int):
+        if (x, y) not in self.start_tiles:
+            print(f"FAIL — Player entered field early at ({x}, {y})!")
+            self._enter_fail()
         if (x, y) not in self.start_tiles and (x, y) not in self.finish_tiles:
             self._maze_visible = False
         self._step(x, y)
 
-    def _playing_press(self, x, y):
+    def _playing_press(self, x: int, y: int):
         self._step(x, y)
 
-    def _fail_press(self, x, y):
-        pass  # reset is handled in _upd_fail via _curr_pressed check
+    def _fail_press(self, x: int, y: int):
+        if (x, y) in self.start_tiles:
+            self._return_presses += 1
+            print(f"Fail: {self._return_presses}/{self.player_count} returned.")
+            if self._return_presses >= self.player_count:
+                print("All returned — new round.")
+                # We intentionally DO NOT reset the timer here so it ticks down continuously
+                self._new_round()
 
-    def _step(self, x, y):
+    def _step(self, x: int, y: int):
         pos = (x, y)
 
-        # ── Finish ──
+        # ── Finish ────────────────────────────────────────────────────────────
         if pos in self.finish_tiles:
             self.finishers += 1
-            pts = int(self.remaining * SCORE_PER_SEC)
-            self.team_score = max(0, self.team_score + pts)
-            print(f"Finish! {self.finishers}/{self.player_count}, +{pts} pts")
-            # Win check: all players on finish (checked via current pressed)
-            # We defer to _upd_playing's win check each frame instead:
+            print(f"Finish! {self.finishers}/{self.player_count}")
+
+            # Check if this is the last player reaching the finish
             if self.finishers >= self.player_count:
+                # Calculate score based ONLY on the time remaining for the last player
+                pts = int(self.remaining * SCORE_PER_SEC)
+                self.team_score = max(0, self.team_score + pts)
+                print(f"Last player finished! Final score calculation: +{pts} pts. Total: {self.team_score}")
                 self._enter_win()
             return
-
+        
         if pos in self.start_tiles:
             return
-
-        # ── Purple hint tile ──
+        
+        # ── Purple hint tile ──────────────────────────────────────────────────
         if pos in self.purple_tiles:
             self._clear_2x2(x, y, self.purple_tiles)
-            pool = [(px, py) for py in range(BOARD_H) for px in range(BOARD_W)
-                    if self.maze[py][px]
-                    and (px, py) not in self.start_tiles
-                    and (px, py) not in self.finish_tiles
-                    and (px, py) not in self.purple_tiles
-                    and (px, py) not in self.yellow_tiles]
-            hints = random.sample(pool, min(3, len(pool)))
+            
+            # Find 2x2 blocks mapped to even coordinates to reveal whole pathways
+            potential_blocks = []
+            for py in range(0, BOARD_H - 1, 2):
+                for px in range(0, BOARD_W - 1, 2):
+                    if (self.maze[py][px]
+                            and (px, py) not in self.start_tiles
+                            and (px, py) not in self.finish_tiles
+                            and (px, py) not in self.purple_tiles
+                            and (px, py) not in self.yellow_tiles):
+                        potential_blocks.append((px, py))
+            
+            chosen_blocks = random.sample(potential_blocks, min(3, len(potential_blocks)))
+            
+            hints = set()
+            for bx, by in chosen_blocks:
+                for dy in range(2):
+                    for dx in range(2):
+                        hints.add((bx + dx, by + dy))
+
             self.purple_reveals.append({
-                "tiles": set(hints), "start": time.time(), "duration": PURPLE_DUR
+                "tiles": hints, "start": time.time(), "duration": PURPLE_DUR
             })
-            print(f"Purple at {pos} — {len(hints)} hints.")
+            print(f"Purple at {pos} — {len(chosen_blocks)} blocks revealed.")
             return
 
-        # ── Yellow path tile ──
+        # ── Yellow path tile ──────────────────────────────────────────────────
         if pos in self.yellow_tiles:
             self._clear_2x2(x, y, self.yellow_tiles)
             path = bfs_path_to_targets(
@@ -729,29 +669,28 @@ class MemoryMazeGame:
                     "tiles": path, "start": time.time(), "duration": YELLOW_DUR
                 })
                 print(f"Yellow at {pos} — path {len(path)} tiles.")
-            # Wall off the 2×2 block
             tx2, ty2 = (x // 2 * 2), (y // 2 * 2)
-            for iy in range(ty2, min(ty2+2, BOARD_H)):
-                for ix in range(tx2, min(tx2+2, BOARD_W)):
+            for iy in range(ty2, min(ty2 + 2, BOARD_H)):
+                for ix in range(tx2, min(tx2 + 2, BOARD_W)):
                     self.maze[iy][ix] = False
             return
 
-        # ── Wall ──
+        # ── Wall ──────────────────────────────────────────────────────────────
         if not self.maze[y][x]:
             print(f"FAIL — wall at {pos}.")
             self._enter_fail()
 
-    def _clear_2x2(self, x, y, tile_set: Set[Coord]):
+    def _clear_2x2(self, x: int, y: int, tile_set: Set[Coord]):
         tx2, ty2 = (x // 2 * 2), (y // 2 * 2)
-        for iy in range(ty2, ty2+2):
-            for ix in range(tx2, tx2+2):
+        for iy in range(ty2, ty2 + 2):
+            for ix in range(tx2, tx2 + 2):
                 tile_set.discard((ix, iy))
 
     # ─────────────────────────────────────────────────────────────────────────
     # State transitions
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _start_game(self, players):
+    def _start_game(self, players: int):
         self.player_count = players
         self.team_score   = 0
         self.finishers    = 0
@@ -761,37 +700,33 @@ class MemoryMazeGame:
         self._new_round()
 
     def _new_round(self):
-        # Recompute start (always same) and pick a new finish position
         self.start_tiles  = self._static_start_tiles()
         fx, fy = pick_finish_position(BOARD_W, BOARD_H)
-        self.finish_tiles = {(fx+dx, fy+dy)
+        self.finish_tiles = {(fx + dx, fy + dy)
                              for dx in range(FINISH_SIZE)
                              for dy in range(FINISH_SIZE)}
 
-        # Generate maze seeded from the start region
         seed_y = START_Y + START_ROWS // 2
         self.maze = generate_thick_maze_prim(
             BOARD_W, BOARD_H, seed_x=START_X, seed_y=seed_y)
 
-        # Force start and finish regions open
         self._force_open(self.start_tiles)
         self._force_open(self.finish_tiles)
-
         self._place_special_tiles()
         self.purple_reveals.clear()
         self.yellow_paths.clear()
 
-        self._reveal_order = bfs_reveal_order(
+        self._reveal_order   = bfs_reveal_order(
             self.maze, self.start_tiles, BOARD_W, BOARD_H)
         self._reveal_count   = 0.0
         self._timer          = MAZE_SHOW_DUR
         self._maze_visible   = True
         self.finishers        = 0
-        self._field_clear_tmr = 0.0
+        self._return_presses  = 0
+        
+        # Reset phase entirely to show maze, audio timer will be instantiated on transit
         self.phase = PHASE_SHOW_MAZE
-
-        # Reset audio timer
-        self._audio_timer = AudioTimer(self.remaining)
+        self._audio_timer = None 
 
         n = sum(c for row in self.maze for c in row)
         print(f"Maze: {n} path tiles  finish at ({fx},{fy})  "
@@ -803,7 +738,6 @@ class MemoryMazeGame:
                 self.maze[y][x] = True
 
     def _place_special_tiles(self):
-        """Place special tiles in 2×2 clusters matching maze thickness."""
         potential = []
         for y in range(0, BOARD_H - 1, 2):
             for x in range(0, BOARD_W - 1, 2):
@@ -814,7 +748,7 @@ class MemoryMazeGame:
         random.shuffle(potential)
 
         def block4(tl):
-            return {(tl[0]+dx, tl[1]+dy) for dx in range(2) for dy in range(2)}
+            return {(tl[0] + dx, tl[1] + dy) for dx in range(2) for dy in range(2)}
 
         self.purple_tiles = set()
         for _ in range(min(NUM_PURPLE, len(potential))):
@@ -831,20 +765,17 @@ class MemoryMazeGame:
         self.phase           = PHASE_FAIL
         self._timer          = FAIL_FLASH_DUR
         self._maze_visible   = False
+        self._return_presses = 0
         self.purple_reveals.clear()
         self.yellow_paths.clear()
-
-    def _enter_reset(self):
-        print("All on start — entering RESET.")
-        self.phase  = PHASE_RESET
-        self._timer = RESET_DUR
-        self._maze_visible = False
+        play_sound("fail.wav")
 
     def _enter_win(self):
         print(f"WIN! Score: {self.team_score}")
         self.phase  = PHASE_WIN
         self._timer = WIN_DUR
         self._spawn_confetti(win=True)
+        play_sound("win.wav")
 
     def _enter_lose(self):
         self.team_score = max(0, self.team_score - FAIL_PENALTY)
@@ -852,6 +783,7 @@ class MemoryMazeGame:
         self.phase  = PHASE_LOSE
         self._timer = LOSE_DUR
         self._spawn_confetti(win=False)
+        play_sound("lose.wav")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Confetti
@@ -866,7 +798,7 @@ class MemoryMazeGame:
              (180,30,0),(255,150,30),(255,80,50),(255,200,80)]
         )
         self._confetti = [
-            {"x": random.uniform(0, BOARD_W-1),
+            {"x": random.uniform(0, BOARD_W - 1),
              "y": random.uniform(-BOARD_H, 0),
              "vx": random.uniform(-1.2, 1.2),
              "vy": random.uniform(5.5, 13.),
@@ -874,13 +806,13 @@ class MemoryMazeGame:
             for _ in range(44)
         ]
 
-    def _upd_confetti(self, dt):
+    def _upd_confetti(self, dt: float):
         for p in self._confetti:
             p["y"] += p["vy"] * dt
             p["x"]  = (p["x"] + p["vx"] * dt) % BOARD_W
             if p["y"] >= BOARD_H:
                 p["y"]  = random.uniform(-4, 0)
-                p["x"]  = random.uniform(0, BOARD_W-1)
+                p["x"]  = random.uniform(0, BOARD_W - 1)
                 p["vy"] = random.uniform(5.5, 13.)
                 p["vx"] = random.uniform(-1.2, 1.2)
 
@@ -888,11 +820,11 @@ class MemoryMazeGame:
     # Low-level drawing helpers
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _px(self, g, x, y, col):
+    def _px(self, g, x: int, y: int, col: tuple):
         if 0 <= x < BOARD_W and 0 <= y < BOARD_H:
             g[(x, y)] = col
 
-    def _fill(self, g, col):
+    def _fill(self, g, col: tuple):
         for k in g:
             g[k] = col
 
@@ -916,7 +848,6 @@ class MemoryMazeGame:
                     g[(x,y)]=(_clamp(r2+140*fade), _clamp(gg+140*fade), _clamp(b2+140*fade))
 
     def _draw_maze_overlay(self, g):
-        """Draw the revealed maze over whatever background is already set."""
         t   = self._phase_time
         now = time.time()
         revealed   = set(self._reveal_order[:int(self._reveal_count)])
@@ -930,7 +861,6 @@ class MemoryMazeGame:
                     g[pos] = GREEN_START
                 elif pos in self.finish_tiles:
                     g[pos] = GREEN_FINISH
-                # Special tiles: only shown when maze IS visible
                 elif pos in self.purple_tiles:
                     g[pos] = _sc(PURPLE_COL, _pulse(t, period=1.0))
                 elif pos in self.yellow_tiles:
@@ -941,14 +871,12 @@ class MemoryMazeGame:
                 else:
                     g[pos] = BLACK
 
-        # Purple reveals
         for rev in self.purple_reveals:
             alpha = _fade_io(now - rev["start"], rev["duration"])
             col   = _sc(HINT_CYAN, .45+alpha*.55)
             for px, py in rev["tiles"]:
                 self._px(g, px, py, col)
 
-        # Yellow path reveals
         for yp in self.yellow_paths:
             alpha = _fade_io(now - yp["start"], yp["duration"])
             col   = _sc(YELLOW_COL, alpha)
@@ -967,15 +895,6 @@ class MemoryMazeGame:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _draw_lobby(self, g):
-        """
-        Lobby layout (all coords in board space):
-          Starfield background.
-          Minus button : 1 col × 3 rows below start (col=1, rows START_Y+4..START_Y+6)
-          Plus  button : cross shape above start (centred at col=1, rows START_Y-3..START_Y-1)
-          Start block  : dim pulsing green  x=0..2, y=START_Y..START_Y+3
-          GO button    : orange, x=3, y=START_Y..START_Y+3
-          Player count : flipped text, faces the start side
-        """
         t = self._phase_time
         self._fill(g, (5, 3, 12))
 
@@ -987,56 +906,44 @@ class MemoryMazeGame:
                     fade = (sv-.982)/.018
                     g[(x,y)] = (_clamp(80*fade), _clamp(80*fade), _clamp(100*fade))
 
-        # Minus button (below start)
+        # Minus button
         a_minus = (.65+.35*abs(math.sin(t*4)) if self._lobby_confirm > 0
                    else .45+.20*math.sin(t*1.8))
         for pos in self._minus_tiles:
             g[pos] = _sc(BTN_MINUS_COL, a_minus)
 
-        # Plus button (above start, cross shape)
+        # Plus button 
         a_plus = (.65+.35*abs(math.sin(t*4)) if self._lobby_confirm > 0
                   else .45+.20*math.sin(t*2.2+1.))
         for pos in self._plus_tiles:
             g[pos] = _sc(BTN_PLUS_COL, a_plus)
 
-        # Start block guide (dim green)
+        # Start block guide
         sa = .28 + .18*math.sin(t*1.2)
         for pos in self.start_tiles:
             g[pos] = _sc(GREEN_START, sa)
 
-        # GO button (orange, right of start)
+        # GO button
         a_go = .55 + .35*abs(math.sin(t*1.5))
         for pos in self._go_tiles:
             g[pos] = _sc(BTN_START_COL, a_go)
 
-        # Player count — flipped text centred near plus button area
-        num_str  = str(self._lobby_players)
-        label    = num_str + "P"
-        tw       = _text_width_3x5(label)
-        # Place text so it reads from the start side; we render at logical coords
-        # then flip internally.  Logical origin: above plus button area, centred.
-        lx = max(0, (BOARD_W - tw) // 2)
-        ly = START_Y - 8   # a few rows above the plus button
+        label   = str(self._lobby_players) + "P"
         num_col = (255, 220, 0) if self._lobby_confirm > 0 else WHITE
-        _text3x5_flipped(g, label, lx, ly, num_col)
+        _draw_centered_rot90(g, label, 5, num_col)
 
     def _draw_show_maze(self, g):
         self._fill(g, BLACK)
         self._draw_maze_overlay(g)
-        # No player count display, no timer on board
 
     def _draw_playing(self, g):
         self._draw_galaxy(g)
         if self._maze_visible:
             self._draw_maze_overlay(g)
         else:
-            t   = self._phase_time
             now = time.time()
-            # Always show start and finish
             for pos in self.start_tiles:  g[pos] = GREEN_START
             for pos in self.finish_tiles: g[pos] = GREEN_FINISH
-            # Special tiles: NOT shown while maze is hidden (per spec)
-            # Active reveals ARE shown
             for rev in self.purple_reveals:
                 a = _fade_io(now - rev["start"], rev["duration"])
                 for px, py in rev["tiles"]:
@@ -1045,7 +952,6 @@ class MemoryMazeGame:
                 a = _fade_io(now - yp["start"], yp["duration"])
                 for px, py in yp["tiles"]:
                     self._px(g, px, py, _sc(YELLOW_COL, a))
-        # No timer on board
 
     def _draw_fail(self, g):
         t = self._phase_time
@@ -1060,44 +966,25 @@ class MemoryMazeGame:
         a = _pulse(t, period=.75, lo=.35, hi=1.)
         for pos in self.start_tiles:
             g[pos] = _sc(GREEN_START, a)
-        # Flipped "GO BACK" text
-        _text3x5_flipped(g, "GO",   2, BOARD_H - 12, WHITE)
-        _text3x5_flipped(g, "BACK", 0, BOARD_H - 7,  WHITE)
-
-    def _draw_reset(self, g):
-        """
-        'RESET GAME' screen.  Red waves radiating FROM the start (left) side.
-        """
-        t  = self._phase_time
-        # Wave direction: toward high x (away from start)
-        for y in range(BOARD_H):
-            for x in range(BOARD_W):
-                wave = math.sin((x * 0.6) - t * 5.0) * 0.5 + 0.5
-                r = _clamp(150 * wave + 50)
-                g[(x, y)] = (r, 0, 0)
-        # Start block bright green
-        for pos in self.start_tiles:
-            g[pos] = GREEN_START
-        # Flipped "RESET GAME" — two lines
-        _text3x5_flipped(g, "RESET", 1, BOARD_H - 14, WHITE)
-        _text3x5_flipped(g, "GAME",  2, BOARD_H - 8,  WHITE)
+        _draw_centered_rot90(g, "RETRY", 9, WHITE)
 
     def _draw_win(self, g):
         self._fill(g, (0, 8, 4))
         self._draw_confetti(g)
-        # Flipped "WIN  xP"
         score_str = str(max(0, self.team_score))
-        label     = "WIN " + score_str + "P"
-        tw        = _text_width_3x5(label)
-        lx        = max(0, (BOARD_W - tw) // 2)
-        _text3x5_flipped(g, "WIN", 1, BOARD_H - 20, WHITE)
-        _text3x5_flipped(g, score_str + " P", 0, BOARD_H - 13, (255, 220, 0))
+        win_h   = _text_height_3x5("WIN")
+        score_h = _text_height_3x5(score_str + "P")
+        gap     = 2
+        total_h = win_h + gap + score_h
+        y0 = max(0, (BOARD_H - total_h) // 2)
+        x0 = (BOARD_W - 5) // 2   
+        _text3x5_rot90(g, "WIN", x0, y0, WHITE)
+        _text3x5_rot90(g, score_str + "P", x0, y0 + win_h + gap, (255, 220, 0))
 
     def _draw_lose(self, g):
         self._fill(g, (8, 0, 0))
         self._draw_confetti(g)
-        # Flipped "LOST"
-        _text3x5_flipped(g, "LOST", 0, BOARD_H - 13, WHITE)
+        _draw_centered_rot90(g, "LOST", (BOARD_W - 5) // 2, WHITE)
 
 
 # =============================================================================
@@ -1105,21 +992,9 @@ class MemoryMazeGame:
 # =============================================================================
 
 class SimWindow:
-    """
-    tkinter window that shows the 16×32 LED grid and relays mouse events
-    to the game as touch press / release events.
-
-    Controls
-    --------
-    Left-click / drag  →  touch press
-    Release            →  touch release
-    F / F11            →  toggle fullscreen
-    Escape             →  exit fullscreen
-    """
-
     CELL_PX = 18
 
-    def __init__(self, root, game):
+    def __init__(self, root: tk.Tk, game: MemoryMazeGame):
         self.root = root
         self.game = game
         self.cell = float(self.CELL_PX)
@@ -1149,7 +1024,7 @@ class SimWindow:
         root.bind("<Configure>", self._on_resize)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._rects = {}
+        self._rects: Dict[Coord, int] = {}
         self._build_rects()
 
         self._last_t = time.time()
@@ -1199,7 +1074,7 @@ class SimWindow:
         oy = (h - c*BOARD_H)/2
         x = int((event.x - ox)/c)
         y = int((event.y - oy)/c)
-        return (x, y) if 0<=x<BOARD_W and 0<=y<BOARD_H else None
+        return (x, y) if 0 <= x < BOARD_W and 0 <= y < BOARD_H else None
 
     def _on_press(self, ev):
         t = self._tile(ev)
@@ -1251,15 +1126,22 @@ class SimWindow:
 
 def main():
     import pygame
+    sim = "--sim" in sys.argv
+    if sim:
+        print("Running in SIMULATION mode (matrix_sim_config.json)")
+    else:
+        print("Running in CONTROLLER mode (matrix_ctrl_config.json)")
+
     pygame.mixer.init()
     _ensure_sounds()
 
-    net  = Network()
+    net  = Network(sim=sim)
     game = MemoryMazeGame(net)
     root = tk.Tk()
     SimWindow(root, game)
     print("Memory Maze SimWindow open.")
-    print("  Click grid = floor touch.  F11 = fullscreen.  Close to quit.\n")
+    print("  Click grid = floor touch.  F11 = fullscreen.  Close to quit.")
+    print("  Pass --sim to use simulation ports (2000/2001).\n")
     game.print_state()
     try:
         root.mainloop()
